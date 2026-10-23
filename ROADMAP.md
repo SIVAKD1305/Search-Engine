@@ -5,10 +5,11 @@
 1. Workspace, document store, sample data generator
 2. Tokenizer: lowercase, accent folding, positions, byte offsets
 3. Inverted index with per-prefix record sets; AND matching with prefix on the last word
+4. Typo tolerance: Damerau-Levenshtein trie walk over the sorted dictionary,
+   prefix-aware, first-letter typo costs double, Algolia's 4/8 thresholds
 
 ## Next
 
-4. Typo tolerance (Damerau-Levenshtein over the dictionary)
 5. Tie-breaking ranking: typo, words, proximity, attribute, exact, custom
 6. Filters and facets
 7. Highlighting and snippets
@@ -28,3 +29,7 @@
   numbers like `price` are indexed too (products: 8,964 words, mostly numbers).
 - Indexing speed: 10k products take about 0.7 s. Profile before optimizing
   (JSON parsing, record clone in `Index::add`, `HashMap` per record).
+- Typo lookup speed: words with 2 allowed typos (8+ letters) take about
+  0.3 ms on a 9k-word dictionary and grow with dictionary size. Options: a
+  Levenshtein automaton over an FST (`fst` crate), or caching expansions of
+  frequent query words.

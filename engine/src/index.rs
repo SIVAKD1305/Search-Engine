@@ -12,6 +12,7 @@
 
 use crate::store::{DocId, DocumentStore, StoreError};
 use crate::tokenizer::tokenize_value;
+use crate::typo::TypoSettings;
 use roaring::RoaringBitmap;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,6 +40,7 @@ pub struct Settings {
     /// Attributes to index, most important first. `None` indexes every
     /// top-level attribute in the order first seen.
     pub searchable_attributes: Option<Vec<String>>,
+    pub typo: TypoSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,15 @@ impl Index {
 
     pub fn store(&self) -> &DocumentStore {
         &self.store
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// The sorted word dictionary, for typo-tolerant lookups.
+    pub fn dictionary(&self) -> &BTreeMap<String, Postings> {
+        &self.words
     }
 
     pub fn attributes(&self) -> &[String] {
@@ -242,6 +253,7 @@ mod tests {
     fn sample() -> Index {
         let mut index = Index::new(Settings {
             searchable_attributes: Some(vec!["name".into(), "description".into()]),
+            ..Settings::default()
         });
         index.add(json!({"objectID": "1", "name": "Wireless Headphones", "description": "Long battery life", "price": 99})).unwrap();
         index.add(json!({"objectID": "2", "name": "Headset Stand", "description": "Holds wireless headsets"})).unwrap();

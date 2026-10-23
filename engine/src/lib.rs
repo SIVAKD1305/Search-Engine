@@ -5,6 +5,7 @@ pub mod index;
 pub mod search;
 pub mod store;
 pub mod tokenizer;
+pub mod typo;
 
 pub use index::{Index, Settings};
 pub use store::{DocId, DocumentStore, StoreError};
