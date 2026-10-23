@@ -13,10 +13,11 @@
    facet counts, `filterOnly(...)`, `optionalFilters` and the `filters` criterion
 7. Highlighting (`_highlightResult`: typo- and prefix-aware, accent-safe,
    HTML-escaped) and snippets (`_snippetResult`, best centered window)
+8. HTTP server (`server/`): Algolia REST paths and JSON, `params` strings,
+   multi-query, batch, partial updates, settings merge, admin/search keys, CORS
 
 ## Next
 
-8. HTTP API (Algolia-like JSON)
 9. Persistence to disk
 10. Plurals, synonyms, stop words, optional words
 11. Replication and multi-node
@@ -27,6 +28,13 @@
   1 ms for 5 hits. Snippet window search allocates a set per window; use a
   sliding count instead. Consider highlighting only the snippet window when
   an attribute is snippeted.
+- Server gaps: data is in memory only (step 9); writes hold the index's write
+  lock while applying, so a big batch pauses searches on that index (Algolia
+  runs indexing in a separate process); no secured (HMAC-restricted) API
+  keys, rate limiting, browse/cursor endpoint, or replica indexes yet.
+- Load test: 2,000 searches with 16 parallel `curl` processes on 4 cores
+  gave p50 4.6 ms, p99 27.6 ms, 315 req/s, all 200s. The client (one process
+  per request) was the bottleneck; measure again with a real load generator.
 - Facets not yet done: `facets_stats` (min/max/avg of numeric facets),
   searching inside facet values (`searchForFacetValues`), nested attributes
   (`brand.name`), and geo filters (`aroundLatLng`, the `geo` criterion).

@@ -123,6 +123,25 @@ impl Index {
         }
     }
 
+    /// Replaces the settings and re-indexes every record, keeping their order.
+    pub fn set_settings(&mut self, settings: Settings) {
+        let records: Vec<Value> = self.store.iter().map(|(_, r)| Value::Object(r.clone())).collect();
+        *self = Index::new(settings);
+        for record in records {
+            self.add(record).expect("stored records are valid");
+        }
+    }
+
+    /// Removes every record but keeps the settings.
+    pub fn clear(&mut self) {
+        *self = Index::new(self.settings.clone());
+    }
+
+    /// The stored record with this objectID.
+    pub fn get_object(&self, object_id: &str) -> Option<&Map<String, Value>> {
+        self.store.get(self.store.id_of(object_id)?)
+    }
+
     pub fn load_jsonl(&mut self, reader: impl std::io::BufRead) -> Result<usize, StoreError> {
         let mut loaded = 0;
         for (i, line) in reader.lines().enumerate() {
@@ -377,5 +396,19 @@ mod tests {
         let hits = &index.word("fast").unwrap().hits[&0];
         assert_eq!(hits.iter().map(|h| h.position).collect::<Vec<_>>(), [0, 2]);
         assert_eq!(index.stats().hits, 4);
+    }
+
+    #[test]
+    fn set_settings_reindexes_and_clear_keeps_settings() {
+        let mut index = sample();
+        assert!(index.word("water").is_some());
+        index.set_settings(Settings { searchable_attributes: Some(vec!["name".into()]), ..Settings::default() });
+        assert!(index.word("water").is_none());
+        assert_eq!(ids(&index.word("kettle").unwrap().docs), [2]);
+        assert_eq!(index.get_object("3").unwrap()["description"], "Boils water fast");
+        index.clear();
+        assert_eq!(index.stats().records, 0);
+        assert_eq!(index.attributes(), ["name"]);
+        assert!(index.get_object("3").is_none());
     }
 }
