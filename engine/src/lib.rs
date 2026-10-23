@@ -1,6 +1,8 @@
 //! A search engine modeled on Algolia's design: prefix-aware inverted index,
 //! query-time typo tolerance and tie-breaking ranking.
 
+pub mod facets;
+pub mod filter;
 pub mod index;
 pub mod ranking;
 pub mod search;

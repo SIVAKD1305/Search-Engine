@@ -1,4 +1,5 @@
 {
   "searchableAttributes": ["title", "actors", "director", "genres", "overview"],
+  "attributesForFaceting": ["genres", "director", "filterOnly(actors)"],
   "customRanking": ["desc(votes)", "desc(rating)"]
 }

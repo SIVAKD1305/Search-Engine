@@ -1,10 +1,11 @@
 //! Loads a JSON Lines file, builds the index and runs queries.
 //!
-//! Usage: search FILE.jsonl [--settings SETTINGS.json] [QUERY ...]
+//! Usage: search FILE.jsonl [--settings SETTINGS.json] [--filters F]
+//!               [--optional F]... [--facets a,b|*] [QUERY ...]
 //! With no queries on the command line, reads one query per line from stdin.
 
 use engine::index::{Index, Settings};
-use engine::search::search;
+use engine::search::{SearchParams, search};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::time::Instant;
@@ -18,13 +19,20 @@ fn label(index: &Index, doc: u32) -> String {
     format!("{:>6}  {text}", record["objectID"].as_str().unwrap_or(""))
 }
 
-fn run(index: &Index, query: &str) {
-    let results = search(index, query, 0, SHOWN);
+fn run(index: &Index, base: &SearchParams, query: &str) {
+    let params = SearchParams { query: query.to_owned(), hits_per_page: SHOWN, ..base.clone() };
+    let results = match search(index, &params) {
+        Ok(results) => results,
+        Err(e) => {
+            println!("\n\"{query}\": {e}");
+            return;
+        }
+    };
     // A single run is noisy (cold caches), so report the median of several.
     let mut times: Vec<f64> = (0..RUNS)
         .map(|_| {
             let start = Instant::now();
-            std::hint::black_box(search(index, query, 0, SHOWN));
+            let _ = std::hint::black_box(search(index, &params));
             start.elapsed().as_secs_f64() * 1000.0
         })
         .collect();
@@ -37,21 +45,26 @@ fn run(index: &Index, query: &str) {
         let more = if more > 0 { format!(" +{more} more") } else { String::new() };
         println!("  {:>12} -> {}{more}", term.text, shown.join(", "));
     }
-    println!("  {:<44} typo words prox attribute exact custom", "");
+    println!("  {:<44} typo words filt prox attribute exact custom", "");
     for hit in &results.hits {
         let i = &hit.info;
         let attr = i.first_matched_attribute.map(|a| index.attributes()[a as usize].as_str()).unwrap_or("-");
         let custom: Vec<String> = i.custom.iter().map(|v| v.map_or("-".into(), |v| v.to_string())).collect();
         println!(
-            "  {:<44} {:>4} {:>5} {:>4} {:<9.9} {:>5} {}",
+            "  {:<44} {:>4} {:>5} {:>4} {:>4} {:<9.9} {:>5} {}",
             label(index, hit.doc).chars().take(44).collect::<String>(),
             i.nb_typos,
             i.words,
+            i.filters,
             i.proximity_distance,
             attr,
             i.nb_exact_words,
             custom.join(",")
         );
+    }
+    for (attribute, counts) in &results.facets {
+        let shown: Vec<String> = counts.iter().take(6).map(|c| format!("{} ({})", c.value, c.count)).collect();
+        println!("  facet {attribute}: {}", shown.join(", "));
     }
 }
 
@@ -59,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut path = None;
     let mut settings = Settings::default();
     let mut queries = Vec::new();
+    let mut base = SearchParams::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -67,11 +81,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 settings = serde_json::from_reader(BufReader::new(File::open(&file)?))
                     .map_err(|e| format!("{file}: {e}"))?;
             }
+            "--filters" => base.filters = Some(args.next().ok_or("--filters needs a value")?),
+            "--optional" => base.optional_filters.push(args.next().ok_or("--optional needs a value")?),
+            "--facets" => {
+                let list = args.next().ok_or("--facets needs a list")?;
+                base.facets = list.split(',').map(|f| f.trim().to_owned()).collect();
+            }
             _ if path.is_none() => path = Some(arg),
             _ => queries.push(arg),
         }
     }
-    let path = path.ok_or("usage: search FILE.jsonl [--settings SETTINGS.json] [QUERY ...]")?;
+    let path = path.ok_or("usage: search FILE.jsonl [--settings S.json] [--filters F] [--optional F] [--facets a,b|*] [QUERY ...]")?;
 
     let start = Instant::now();
     let mut index = Index::new(settings);
@@ -89,11 +109,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if queries.is_empty() {
         for line in io::stdin().lock().lines() {
-            run(&index, line?.trim());
+            run(&index, &base, line?.trim());
         }
     } else {
         for query in &queries {
-            run(&index, query);
+            run(&index, &base, query);
         }
     }
     Ok(())

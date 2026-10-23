@@ -1,3 +1,4 @@
 {
-  "searchableAttributes": ["title", "tags", "topic", "author", "body"]
+  "searchableAttributes": ["title", "tags", "topic", "author", "body"],
+  "attributesForFaceting": ["topic", "tags", "author"]
 }

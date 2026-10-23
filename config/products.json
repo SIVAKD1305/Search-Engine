@@ -1,4 +1,5 @@
 {
   "searchableAttributes": ["name", "brand", "category", "features", "description"],
+  "attributesForFaceting": ["brand", "category", "color", "in_stock", "features"],
   "customRanking": ["desc(rating)", "desc(reviews_count)"]
 }

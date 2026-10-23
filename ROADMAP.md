@@ -9,10 +9,11 @@
    prefix-aware, first-letter typo costs double, Algolia's 4/8 thresholds
 5. Tie-breaking ranking (typo, words, proximity, attribute, exact, custom),
    JSON settings with Algolia names, pagination, per-dataset configs in `config/`
+6. Filters (Algolia `filters` syntax: facets, numbers, ranges, AND/OR/NOT),
+   facet counts, `filterOnly(...)`, `optionalFilters` and the `filters` criterion
 
 ## Next
 
-6. Filters and facets
 7. Highlighting and snippets
 8. HTTP API (Algolia-like JSON)
 9. Persistence to disk
@@ -20,6 +21,10 @@
 11. Replication and multi-node
 
 ## Remember for later
+
+- Facets not yet done: `facets_stats` (min/max/avg of numeric facets),
+  searching inside facet values (`searchForFacetValues`), nested attributes
+  (`brand.name`), and geo filters (`aroundLatLng`, the `geo` criterion).
 
 - **Proper Chinese/Japanese word splitting.** The tokenizer currently makes
   each Han/Kana character its own token (`engine/src/tokenizer.rs`,

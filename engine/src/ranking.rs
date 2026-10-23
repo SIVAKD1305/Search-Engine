@@ -6,6 +6,7 @@
 //!
 //! 1. `typo`      — fewer typos first
 //! 2. `words`     — more query words matched first
+//!    `filters`   — more `optionalFilters` matched first
 //! 3. `proximity` — query words closer together first
 //! 4. `attribute` — match in a more important attribute first
 //! 5. `exact`     — more words matched exactly (whole word, no typo) first
@@ -28,6 +29,7 @@ pub const MAX_PROXIMITY: u32 = 8;
 pub enum Criterion {
     Typo,
     Words,
+    Filters,
     Proximity,
     Attribute,
     Exact,
@@ -41,7 +43,7 @@ pub struct Ranking(pub Vec<Criterion>);
 impl Default for Ranking {
     fn default() -> Self {
         use Criterion::*;
-        Ranking(vec![Typo, Words, Proximity, Attribute, Exact, Custom])
+        Ranking(vec![Typo, Words, Filters, Proximity, Attribute, Exact, Custom])
     }
 }
 
@@ -86,6 +88,8 @@ impl From<CustomRule> for String {
 pub struct RankingInfo {
     pub nb_typos: u32,
     pub words: u32,
+    /// Number of `optionalFilters` this record matches.
+    pub filters: u32,
     pub proximity_distance: u32,
     /// Most important attribute containing a query word.
     pub first_matched_attribute: Option<AttributeId>,
@@ -109,8 +113,9 @@ struct TermInDoc {
     hits: Vec<Hit>,
 }
 
-/// Sorts `candidates` by the index's ranking criteria.
-pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap) -> Vec<RankedDoc> {
+/// Sorts `candidates` by the index's ranking criteria. `boosts` are the
+/// record sets of the query's optional filters.
+pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boosts: &[RoaringBitmap]) -> Vec<RankedDoc> {
     let docs: Vec<DocId> = candidates.iter().collect();
     let n_terms = terms.len();
     let mut cells: Vec<TermInDoc> = vec![TermInDoc::default(); docs.len() * n_terms];
@@ -139,7 +144,9 @@ pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap) -> V
                 cell.hits.dedup();
             }
             let record = index.store().get(doc).expect("candidate is live");
-            RankedDoc { doc, info: ranking_info(row, record, &settings.custom_ranking) }
+            let mut info = ranking_info(row, record, &settings.custom_ranking);
+            info.filters = boosts.iter().filter(|b| b.contains(doc)).count() as u32;
+            RankedDoc { doc, info }
         })
         .collect();
 
@@ -163,6 +170,7 @@ fn ranking_info(row: &[TermInDoc], record: &Map<String, Value>, custom: &[Custom
     RankingInfo {
         nb_typos: row.iter().filter_map(|c| c.typos).map(u32::from).sum(),
         words: row.iter().filter(|c| c.typos.is_some()).count() as u32,
+        filters: 0,
         proximity_distance,
         first_matched_attribute: row.iter().flat_map(|c| &c.hits).map(|h| h.attribute).min(),
         nb_exact_words: row.iter().filter(|c| c.exact).count() as u32,
@@ -199,6 +207,7 @@ fn compare(criterion: Criterion, a: &RankingInfo, b: &RankingInfo, custom: &[Cus
     match criterion {
         Criterion::Typo => a.nb_typos.cmp(&b.nb_typos),
         Criterion::Words => b.words.cmp(&a.words),
+        Criterion::Filters => b.filters.cmp(&a.filters),
         Criterion::Proximity => a.proximity_distance.cmp(&b.proximity_distance),
         Criterion::Attribute => missing_last(a.first_matched_attribute, b.first_matched_attribute, |x, y| x.cmp(&y)),
         Criterion::Exact => b.nb_exact_words.cmp(&a.nb_exact_words),
@@ -230,7 +239,7 @@ fn missing_last<T>(x: Option<T>, y: Option<T>, cmp: impl FnOnce(T, T) -> Orderin
 mod tests {
     use super::*;
     use crate::index::Settings;
-    use crate::search::search;
+    use crate::search::{SearchParams, SearchResults, search};
     use serde_json::json;
 
     fn index(settings: Settings, records: &[Value]) -> Index {
@@ -249,8 +258,12 @@ mod tests {
         .unwrap()
     }
 
+    fn run(index: &Index, query: &str) -> SearchResults {
+        search(index, &SearchParams { hits_per_page: 100, ..SearchParams::new(query) }).unwrap()
+    }
+
     fn order(index: &Index, query: &str) -> Vec<String> {
-        search(index, query, 0, 100)
+        run(index, query)
             .hits
             .iter()
             .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
@@ -292,7 +305,7 @@ mod tests {
             json!({"objectID": "adjacent", "name": "Wireless headphones"}),
         ]);
         assert_eq!(order(&i, "wireless headphones"), ["adjacent", "reversed", "far"]);
-        let info = &search(&i, "wireless headphones", 0, 10).hits[0].info;
+        let info = &run(&i, "wireless headphones").hits[0].info;
         assert_eq!(info.proximity_distance, 1);
     }
 
@@ -303,7 +316,7 @@ mod tests {
             json!({"objectID": "together", "name": "Speaker", "description": "wireless headphones"}),
         ]);
         assert_eq!(order(&i, "wireless headphones"), ["together", "split"]);
-        let hits = search(&i, "wireless headphones", 0, 10).hits;
+        let hits = run(&i, "wireless headphones").hits;
         assert_eq!(hits[1].info.proximity_distance, MAX_PROXIMITY);
     }
 
@@ -353,12 +366,13 @@ mod tests {
         let records: Vec<Value> =
             (0..25).map(|n| json!({"objectID": n.to_string(), "name": "Kettle", "rating": n})).collect();
         let i = index(products(), &records);
-        let page = search(&i, "kettle", 2, 10);
+        let params = |page| SearchParams { page, hits_per_page: 10, ..SearchParams::new("kettle") };
+        let page = search(&i, &params(2)).unwrap();
         assert_eq!((page.nb_hits, page.nb_pages, page.hits.len()), (25, 3, 5));
         let ids: Vec<&str> =
             page.hits.iter().map(|h| i.store().get(h.doc).unwrap()["objectID"].as_str().unwrap()).collect();
         assert_eq!(ids, ["4", "3", "2", "1", "0"]);
-        assert!(search(&i, "kettle", 9, 10).hits.is_empty());
+        assert!(search(&i, &params(9)).unwrap().hits.is_empty());
     }
 
     #[test]

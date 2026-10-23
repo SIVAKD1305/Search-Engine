@@ -1,4 +1,4 @@
-//! Query execution (matching with typo tolerance; ranking comes later).
+//! Query execution: matching with typo tolerance, filters, facets and ranking.
 //!
 //! Each query word is expanded into the dictionary words it can stand for:
 //! itself, words within the allowed number of typos, and — for the last word,
@@ -6,11 +6,15 @@
 //! default `queryType: prefixLast`). A record matches when every query word
 //! matches at least one of its expansions.
 
+use crate::facets::FacetCount;
+use crate::filter::{self, FilterError};
 use crate::index::Index;
 use crate::ranking::{RankedDoc, rank};
 use crate::tokenizer::tokenize;
 use crate::typo::{WordMatch, fuzzy_matches};
 use roaring::RoaringBitmap;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug)]
 pub struct QueryTerm {
@@ -55,6 +59,42 @@ fn term_docs(index: &Index, text: &str, is_prefix: bool, max_typos: u8, matches:
     docs
 }
 
+/// A search request, with Algolia's parameter names when read from JSON.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SearchParams {
+    pub query: String,
+    /// Required conditions, in Algolia's `filters` syntax.
+    pub filters: Option<String>,
+    /// Conditions that boost records matching them, without excluding others.
+    pub optional_filters: Vec<String>,
+    /// Facet attributes to count; `"*"` means all of them.
+    pub facets: Vec<String>,
+    pub page: usize,
+    pub hits_per_page: usize,
+    pub max_values_per_facet: usize,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        SearchParams {
+            query: String::new(),
+            filters: None,
+            optional_filters: Vec::new(),
+            facets: Vec::new(),
+            page: 0,
+            hits_per_page: 20,
+            max_values_per_facet: 100,
+        }
+    }
+}
+
+impl SearchParams {
+    pub fn new(query: impl Into<String>) -> Self {
+        SearchParams { query: query.into(), ..Self::default() }
+    }
+}
+
 #[derive(Debug)]
 pub struct SearchResults {
     /// The requested page of ranked records.
@@ -63,25 +103,51 @@ pub struct SearchResults {
     pub page: usize,
     pub nb_pages: usize,
     pub hits_per_page: usize,
+    /// Value counts per requested facet, over all hits (not just this page).
+    pub facets: BTreeMap<String, Vec<FacetCount>>,
     pub terms: Vec<QueryTerm>,
 }
 
 /// Runs a query and returns one page (0-based) of ranked results.
-pub fn search(index: &Index, query: &str, page: usize, hits_per_page: usize) -> SearchResults {
-    let hits_per_page = hits_per_page.max(1);
-    let terms = plan(index, query);
-    let candidates = intersect(index, &terms);
-    let ranked = rank(index, &terms, &candidates);
+pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, FilterError> {
+    let hits_per_page = params.hits_per_page.max(1);
+    let terms = plan(index, &params.query);
+    let mut candidates = intersect(index, &terms);
+    if let Some(filters) = params.filters.as_deref().filter(|f| !f.trim().is_empty()) {
+        candidates &= filter::parse(filters)?.evaluate(index)?;
+    }
+    let boosts = params
+        .optional_filters
+        .iter()
+        .map(|f| filter::parse(f)?.evaluate(index))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut facets = BTreeMap::new();
+    for requested in &params.facets {
+        let attributes: Vec<&str> =
+            if requested == "*" { index.countable_facets().collect() } else { vec![requested.as_str()] };
+        for attribute in attributes {
+            if index.countable_facets().any(|a| a == attribute) {
+                facets.insert(
+                    attribute.to_owned(),
+                    index.facet_counts(attribute, &candidates, params.max_values_per_facet),
+                );
+            }
+        }
+    }
+
+    let ranked = rank(index, &terms, &candidates, &boosts);
     let nb_hits = candidates.len();
-    let hits = ranked.into_iter().skip(page.saturating_mul(hits_per_page)).take(hits_per_page).collect();
-    SearchResults {
+    let hits = ranked.into_iter().skip(params.page.saturating_mul(hits_per_page)).take(hits_per_page).collect();
+    Ok(SearchResults {
         hits,
         nb_hits,
-        page,
+        page: params.page,
         nb_pages: (nb_hits as usize).div_ceil(hits_per_page),
         hits_per_page,
+        facets,
         terms,
-    }
+    })
 }
 
 /// Records matching every word of `query`. An empty query matches everything.
@@ -188,5 +254,111 @@ mod tests {
         assert!(ids(&index, "wireless toaster").is_empty());
         assert_eq!(ids(&index, "").len(), 5);
         assert_eq!(ids(&index, " ,, ").len(), 5);
+    }
+
+    fn shop() -> Index {
+        let settings: Settings = serde_json::from_value(json!({
+            "searchableAttributes": ["name"],
+            "attributesForFaceting": ["brand", "color", "in_stock", "filterOnly(sku)"],
+            "customRanking": ["desc(rating)"]
+        }))
+        .unwrap();
+        let mut index = Index::new(settings);
+        for r in [
+            json!({"objectID": "1", "name": "Kettle", "brand": "Élan", "color": "Black", "price": 25, "rating": 4.0, "in_stock": true, "sku": "K-1"}),
+            json!({"objectID": "2", "name": "Kettle", "brand": "Orbix", "color": "White", "price": 80, "rating": 4.5, "in_stock": false, "sku": "K-2"}),
+            json!({"objectID": "3", "name": "Kettle", "brand": "Élan", "color": "White", "price": 120, "rating": 3.0, "in_stock": true, "sku": "K-3"}),
+            json!({"objectID": "4", "name": "Toaster", "brand": "Élan", "color": "Black", "price": 40, "rating": 5.0, "in_stock": true, "sku": "T-1"}),
+        ] {
+            index.add(r).unwrap();
+        }
+        index
+    }
+
+    fn found(index: &Index, query: &str, filters: &str) -> Vec<String> {
+        let params = SearchParams { filters: Some(filters.into()), ..SearchParams::new(query) };
+        search(index, &params)
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn filters_combine_facets_numbers_and_logic() {
+        let index = shop();
+        assert_eq!(found(&index, "kettle", "brand:elan"), ["1", "3"]);
+        assert_eq!(found(&index, "kettle", "brand:Élan AND price < 100"), ["1"]);
+        assert_eq!(found(&index, "", "price:40 TO 120 AND NOT color:white"), ["4"]);
+        assert_eq!(found(&index, "kettle", "(color:Black OR brand:Orbix) AND in_stock:true"), ["1"]);
+        assert_eq!(found(&index, "", "price != 25 AND price >= 80"), ["2", "3"]);
+        assert_eq!(found(&index, "", "sku:K-2"), ["2"]);
+        // A non-facet numeric attribute can be matched with ':' too.
+        assert_eq!(found(&index, "", "price:80"), ["2"]);
+        assert_eq!(found(&index, "kettle", "  "), ["2", "1", "3"]);
+    }
+
+    #[test]
+    fn invalid_filters_are_errors() {
+        let index = shop();
+        let error = |f: &str| {
+            search(&index, &SearchParams { filters: Some(f.into()), ..SearchParams::new("") }).unwrap_err().0
+        };
+        assert_eq!(error("name:Kettle"), "'name' is not in attributesForFaceting");
+        assert_eq!(error("price <"), "missing value for 'price'");
+    }
+
+    #[test]
+    fn facet_counts_cover_all_filtered_hits() {
+        let index = shop();
+        let params = SearchParams {
+            facets: vec!["*".into()],
+            filters: Some("in_stock:true".into()),
+            hits_per_page: 1,
+            ..SearchParams::new("")
+        };
+        let results = search(&index, &params).unwrap();
+        assert_eq!(results.hits.len(), 1);
+        let counts = |attr: &str| -> Vec<(String, u64)> {
+            results.facets[attr].iter().map(|c| (c.value.clone(), c.count)).collect()
+        };
+        assert_eq!(counts("brand"), [("Élan".to_owned(), 3)]);
+        assert_eq!(counts("color"), [("Black".to_owned(), 2), ("White".to_owned(), 1)]);
+        // filterOnly attributes never return counts.
+        assert!(!results.facets.contains_key("sku"));
+        assert_eq!(results.facets.keys().collect::<Vec<_>>(), ["brand", "color", "in_stock"]);
+    }
+
+    #[test]
+    fn optional_filters_boost_without_excluding() {
+        let index = shop();
+        let params = SearchParams { optional_filters: vec!["brand:Orbix".into()], ..SearchParams::new("kettle") };
+        let results = search(&index, &params).unwrap();
+        let order: Vec<&str> =
+            results.hits.iter().map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap()).collect();
+        assert_eq!(order, ["2", "1", "3"]);
+        assert_eq!(results.hits[0].info.filters, 1);
+        assert_eq!(results.nb_hits, 3);
+    }
+
+    #[test]
+    fn deleted_and_replaced_records_leave_filters() {
+        let mut index = shop();
+        index.delete("4");
+        assert!(found(&index, "", "price:40").is_empty());
+        index.add(json!({"objectID": "1", "name": "Kettle", "brand": "Orbix", "price": 30})).unwrap();
+        assert_eq!(found(&index, "", "brand:elan"), ["3"]);
+        assert_eq!(found(&index, "", "price < 50"), ["1"]);
+    }
+
+    #[test]
+    fn search_params_read_algolia_json() {
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "kettle", "filters": "price < 50", "hitsPerPage": 5, "facets": ["brand"]
+        }))
+        .unwrap();
+        assert_eq!((params.hits_per_page, params.page, params.max_values_per_facet), (5, 0, 100));
+        assert_eq!(params.filters.as_deref(), Some("price < 50"));
     }
 }

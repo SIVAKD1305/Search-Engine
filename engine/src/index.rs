@@ -12,6 +12,7 @@
 
 use crate::store::{DocId, DocumentStore, StoreError};
 use crate::tokenizer::tokenize_value;
+use crate::facets::{FacetAttribute, FacetCount, FacetIndex, NumericIndex};
 use crate::ranking::{CustomRule, Ranking};
 use crate::typo::TypoSettings;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,8 @@ pub struct Settings {
     pub ranking: Ranking,
     /// Numeric attributes used by the `custom` criterion, most important first.
     pub custom_ranking: Vec<CustomRule>,
+    /// Attributes usable in facet filters and facet counts.
+    pub attributes_for_faceting: Vec<FacetAttribute>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,12 +71,17 @@ pub struct Index {
     attributes: Vec<String>,
     words: BTreeMap<String, Postings>,
     prefixes: HashMap<String, RoaringBitmap>,
+    facets: FacetIndex,
+    numbers: NumericIndex,
+    /// Ids of all live records.
+    live: RoaringBitmap,
 }
 
 impl Index {
     pub fn new(settings: Settings) -> Self {
         let attributes = settings.searchable_attributes.clone().unwrap_or_default();
-        Index { settings, attributes, ..Default::default() }
+        let facets = FacetIndex::new(&settings.attributes_for_faceting);
+        Index { settings, attributes, facets, ..Default::default() }
     }
 
     pub fn store(&self) -> &DocumentStore {
@@ -150,7 +158,30 @@ impl Index {
 
     /// Ids of all live records.
     pub fn all_docs(&self) -> RoaringBitmap {
-        self.store.iter().map(|(id, _)| id).collect()
+        self.live.clone()
+    }
+
+    pub fn is_facet(&self, attribute: &str) -> bool {
+        self.facets.contains(attribute)
+    }
+
+    /// Facet attributes that return counts (not `filterOnly`), in settings order.
+    pub fn countable_facets(&self) -> impl Iterator<Item = &str> {
+        self.settings.attributes_for_faceting.iter().filter(|f| !f.filter_only).map(|f| f.attribute.as_str())
+    }
+
+    /// Records whose facet `attribute` has `value` (case- and accent-insensitive).
+    pub fn facet_docs(&self, attribute: &str, value: &str) -> RoaringBitmap {
+        self.facets.docs(attribute, value)
+    }
+
+    pub fn facet_counts(&self, attribute: &str, candidates: &RoaringBitmap, limit: usize) -> Vec<FacetCount> {
+        self.facets.counts(attribute, candidates, limit)
+    }
+
+    /// Records with a numeric `attribute` value inside the bounds.
+    pub fn numeric_docs(&self, attribute: &str, low: Bound<f64>, high: Bound<f64>) -> RoaringBitmap {
+        self.numbers.docs(attribute, low, high)
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -192,6 +223,9 @@ impl Index {
     }
 
     fn index(&mut self, id: DocId, doc: &Map<String, Value>) {
+        self.live.insert(id);
+        self.facets.add(id, doc);
+        self.numbers.add(id, doc);
         let mut hits: HashMap<String, Vec<Hit>> = HashMap::new();
         for (attribute, value) in self.searchable_fields(doc) {
             for token in tokenize_value(value) {
@@ -221,6 +255,9 @@ impl Index {
     /// Removes a record's postings. The old record is re-tokenized to find its
     /// words, so no per-record word list has to be kept in memory.
     fn unindex(&mut self, id: DocId, old: &Map<String, Value>) {
+        self.live.remove(id);
+        self.facets.remove(id, old);
+        self.numbers.remove(id, old);
         let mut words = HashSet::new();
         for (_, value) in self.searchable_fields(old) {
             words.extend(tokenize_value(value).into_iter().map(|t| t.text));
