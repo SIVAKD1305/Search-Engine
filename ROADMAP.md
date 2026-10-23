@@ -15,10 +15,11 @@
    HTML-escaped) and snippets (`_snippetResult`, best centered window)
 8. HTTP server (`server/`): Algolia REST paths and JSON, `params` strings,
    multi-query, batch, partial updates, settings merge, admin/search keys, CORS
+9. Persistence: per-index snapshot + checksummed write-ahead log, fsync before
+   acknowledging, torn-tail recovery, compaction into a new generation
 
 ## Next
 
-9. Persistence to disk
 10. Plurals, synonyms, stop words, optional words
 11. Replication and multi-node
 
@@ -28,9 +29,16 @@
   1 ms for 5 hits. Snippet window search allocates a set per window; use a
   sliding count instead. Consider highlighting only the snippet window when
   an attribute is snippeted.
-- Server gaps: data is in memory only (step 9); writes hold the index's write
-  lock while applying, so a big batch pauses searches on that index (Algolia
-  runs indexing in a separate process); no secured (HMAC-restricted) API
+- Startup re-indexes every record from the snapshot (10k products: about
+  0.6 s). For large indexes, save the built index structures (dictionary,
+  postings, bitmaps) instead of only the records, e.g. as memory-mapped files.
+- Each single-record write waits for its own fsync (about 11 ms per request in
+  this container, including curl). Group commit (one fsync for writes that
+  arrive together) would raise write throughput; batches already share one.
+- Server gaps: applying a write holds the index's write lock, so a big batch
+  pauses searches on that index while it is applied in memory (the fsync
+  itself does not block searches; Algolia runs indexing in a separate
+  process); no secured (HMAC-restricted) API
   keys, rate limiting, browse/cursor endpoint, or replica indexes yet.
 - Load test: 2,000 searches with 16 parallel `curl` processes on 4 cores
   gave p50 4.6 ms, p99 27.6 ms, 315 req/s, all 200s. The client (one process

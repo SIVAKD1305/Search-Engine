@@ -31,6 +31,11 @@ curl -H 'X-Algolia-API-Key: my-search' -X POST \
 
 Without the environment variables, random keys are generated and printed.
 
+Data is saved in `./search-data` (change with `--data-dir DIR`, or use
+`--in-memory`) and loaded again at startup. Every write is in the index's
+write-ahead log on disk before the server answers, so it survives a crash.
+`--load` replaces an index with the records of a JSONL file.
+
 | Method | Path | Key |
 |---|---|---|
 | POST | `/1/indexes/{index}/query` | search |

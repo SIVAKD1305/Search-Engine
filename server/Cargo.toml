@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8"
+crc32fast = "1"
 engine = { version = "0.1.0", path = "../engine" }
 form_urlencoded = "1"
 rand = "0.8"
@@ -16,4 +17,5 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

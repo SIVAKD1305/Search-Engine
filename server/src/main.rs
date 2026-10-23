@@ -1,7 +1,10 @@
 //! Starts the search server.
 //!
-//! Usage: server [--host 127.0.0.1] [--port 8080]
+//! Usage: server [--host 127.0.0.1] [--port 8080] [--data-dir DIR | --in-memory]
 //!               [--load NAME=records.jsonl[,settings.json]]...
+//!
+//! Data is kept in DIR (default `./search-data`) and reloaded at startup.
+//! `--load` replaces that index with the file's records.
 //!
 //! Keys come from SEARCH_ADMIN_KEY and SEARCH_SEARCH_KEY. A missing key is
 //! generated and printed once at startup.
@@ -11,7 +14,9 @@ use rand::RngCore;
 use server::{AppState, app};
 use std::fs::File;
 use std::io::BufReader;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 fn random_key() -> String {
     let mut bytes = [0u8; 16];
@@ -48,12 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut host = "127.0.0.1".to_owned();
     let mut port = 8080u16;
     let mut loads = Vec::new();
+    let mut data_dir = Some(PathBuf::from("search-data"));
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--host" => host = args.next().ok_or("--host needs a value")?,
             "--port" => port = args.next().ok_or("--port needs a value")?.parse()?,
             "--load" => loads.push(args.next().ok_or("--load needs a value")?),
+            "--data-dir" => data_dir = Some(args.next().ok_or("--data-dir needs a value")?.into()),
+            "--in-memory" => data_dir = None,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -70,10 +78,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("search key: {search_key}  (set SEARCH_SEARCH_KEY to keep it)");
     }
 
-    let state = Arc::new(AppState::new(admin_key, search_key));
+    let state = match &data_dir {
+        Some(dir) => {
+            let start = Instant::now();
+            let state = AppState::open(admin_key, search_key, dir)?;
+            let names = state.index_names();
+            println!(
+                "data directory {}: {} index(es) loaded in {:.0} ms {:?}",
+                dir.display(),
+                names.len(),
+                start.elapsed().as_secs_f64() * 1000.0,
+                names
+            );
+            state
+        }
+        None => {
+            println!("in-memory mode: data is lost when the server stops");
+            AppState::new(admin_key, search_key)
+        }
+    };
+    let state = Arc::new(state);
     for spec in &loads {
         let (name, index) = load(spec)?;
-        state.insert_index(&name, index);
+        state.insert_index(&name, index)?;
     }
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;

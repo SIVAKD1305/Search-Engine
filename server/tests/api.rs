@@ -20,6 +20,11 @@ impl Client {
         Client { router: app(Arc::new(AppState::new(ADMIN.into(), SEARCH.into()))) }
     }
 
+    /// A server backed by `dir`; a new one on the same dir is a restart.
+    fn persistent(dir: &std::path::Path) -> Self {
+        Client { router: app(Arc::new(AppState::open(ADMIN.into(), SEARCH.into(), dir).unwrap())) }
+    }
+
     async fn call(&self, method: Method, path: &str, key: Option<&str>, body: Option<Value>) -> (StatusCode, Value) {
         let mut request = Request::builder().method(method).uri(path);
         if let Some(key) = key {
@@ -252,4 +257,67 @@ async fn index_management_and_errors() {
     c.admin(Method::DELETE, "/1/indexes/products", None).await;
     let (status, _) = c.call(Method::POST, "/1/indexes/products/query", Some(SEARCH), Some(json!({}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn data_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = Client::persistent(dir.path());
+        c.seed().await;
+        c.admin(Method::PUT, "/1/indexes/products/3", Some(json!({"name": "Teapot", "brand": "Élan", "rating": 5}))).await;
+        c.admin(Method::DELETE, "/1/indexes/products/2", None).await;
+        c.admin(Method::POST, "/1/indexes/notes", Some(json!({"objectID": "n1", "text": "remember the milk"}))).await;
+    }
+    let c = Client::persistent(dir.path());
+    let r = c.search("products", json!({"query": "", "facets": ["brand"]})).await;
+    assert_eq!(ids(&r), ["3", "1"]);
+    assert_eq!(r["facets"]["brand"], json!({"Élan": 2}));
+    // Settings came back too: brand is still searchable, ranking is by rating.
+    let settings = c.admin(Method::GET, "/1/indexes/products/settings", None).await;
+    assert_eq!(settings["customRanking"], json!(["desc(rating)"]));
+    assert_eq!(ids(&c.search("notes", json!({"query": "milk"})).await), ["n1"]);
+
+    // Deleting an index removes it from disk as well.
+    c.admin(Method::DELETE, "/1/indexes/notes", None).await;
+    let c = Client::persistent(dir.path());
+    let list = c.admin(Method::GET, "/1/indexes", None).await;
+    assert_eq!(list["items"], json!([{"name": "products", "entries": 2}]));
+}
+
+#[tokio::test]
+async fn batch_partial_updates_see_earlier_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = Client::persistent(dir.path());
+        c.admin(
+            Method::POST,
+            "/1/indexes/items/batch",
+            Some(json!({"requests": [
+                {"action": "addObject", "body": {"objectID": "a", "name": "Lamp", "price": 10}},
+                {"action": "partialUpdateObject", "body": {"objectID": "a", "price": 12}},
+                {"action": "clear"},
+                {"action": "partialUpdateObjectNoCreate", "body": {"objectID": "a", "price": 99}},
+                {"action": "addObject", "body": {"objectID": "b", "name": "Desk"}},
+                {"action": "partialUpdateObject", "body": {"objectID": "b", "color": "oak"}}
+            ]})),
+        )
+        .await;
+    }
+    let c = Client::persistent(dir.path());
+    let (status, _) = c.call(Method::GET, "/1/indexes/items/a", Some(ADMIN), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let b = c.admin(Method::GET, "/1/indexes/items/b", None).await;
+    assert_eq!(b, json!({"objectID": "b", "name": "Desk", "color": "oak"}));
+}
+
+#[tokio::test]
+async fn index_names_cannot_escape_the_data_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Client::persistent(dir.path());
+    for name in ["..", ".hidden", "."] {
+        let (status, _) = c.call(Method::POST, &format!("/1/indexes/{name}/batch"), Some(ADMIN), Some(json!({"requests": []}))).await;
+        assert_ne!(status, StatusCode::OK, "{name}");
+    }
+    assert!(std::fs::read_dir(dir.path().join("indexes")).unwrap().next().is_none());
 }
