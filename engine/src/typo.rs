@@ -11,14 +11,20 @@
 //! scan over the dictionary, guided by the maximum acceptable distance" that
 //! Algolia describes.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized with Algolia's setting names.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct TypoSettings {
+    #[serde(rename = "typoTolerance")]
     pub enabled: bool,
     /// Shorter query words must match exactly.
+    #[serde(rename = "minWordSizefor1Typo")]
     pub min_word_size_for_1_typo: usize,
+    #[serde(rename = "minWordSizefor2Typos")]
     pub min_word_size_for_2_typos: usize,
 }
 

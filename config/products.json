@@ -1,0 +1,4 @@
+{
+  "searchableAttributes": ["name", "brand", "category", "features", "description"],
+  "customRanking": ["desc(rating)", "desc(reviews_count)"]
+}

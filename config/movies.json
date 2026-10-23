@@ -1,0 +1,4 @@
+{
+  "searchableAttributes": ["title", "actors", "director", "genres", "overview"],
+  "customRanking": ["desc(votes)", "desc(rating)"]
+}

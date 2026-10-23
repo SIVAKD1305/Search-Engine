@@ -2,6 +2,7 @@
 //! query-time typo tolerance and tie-breaking ranking.
 
 pub mod index;
+pub mod ranking;
 pub mod search;
 pub mod store;
 pub mod tokenizer;

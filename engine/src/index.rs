@@ -12,7 +12,9 @@
 
 use crate::store::{DocId, DocumentStore, StoreError};
 use crate::tokenizer::tokenize_value;
+use crate::ranking::{CustomRule, Ranking};
 use crate::typo::TypoSettings;
+use serde::{Deserialize, Serialize};
 use roaring::RoaringBitmap;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,12 +37,20 @@ pub struct Postings {
     pub hits: HashMap<DocId, Vec<Hit>>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Index settings, read from JSON with Algolia's names, e.g.
+/// `{"searchableAttributes": ["name"], "customRanking": ["desc(rating)"]}`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     /// Attributes to index, most important first. `None` indexes every
     /// top-level attribute in the order first seen.
     pub searchable_attributes: Option<Vec<String>>,
+    #[serde(flatten)]
     pub typo: TypoSettings,
+    /// Order of the tie-breaking criteria.
+    pub ranking: Ranking,
+    /// Numeric attributes used by the `custom` criterion, most important first.
+    pub custom_ranking: Vec<CustomRule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

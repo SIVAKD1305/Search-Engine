@@ -1,0 +1,3 @@
+{
+  "searchableAttributes": ["title", "tags", "topic", "author", "body"]
+}

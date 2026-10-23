@@ -7,6 +7,7 @@
 //! matches at least one of its expansions.
 
 use crate::index::Index;
+use crate::ranking::{RankedDoc, rank};
 use crate::tokenizer::tokenize;
 use crate::typo::{WordMatch, fuzzy_matches};
 use roaring::RoaringBitmap;
@@ -52,6 +53,35 @@ fn term_docs(index: &Index, text: &str, is_prefix: bool, max_typos: u8, matches:
         }
     }
     docs
+}
+
+#[derive(Debug)]
+pub struct SearchResults {
+    /// The requested page of ranked records.
+    pub hits: Vec<RankedDoc>,
+    pub nb_hits: u64,
+    pub page: usize,
+    pub nb_pages: usize,
+    pub hits_per_page: usize,
+    pub terms: Vec<QueryTerm>,
+}
+
+/// Runs a query and returns one page (0-based) of ranked results.
+pub fn search(index: &Index, query: &str, page: usize, hits_per_page: usize) -> SearchResults {
+    let hits_per_page = hits_per_page.max(1);
+    let terms = plan(index, query);
+    let candidates = intersect(index, &terms);
+    let ranked = rank(index, &terms, &candidates);
+    let nb_hits = candidates.len();
+    let hits = ranked.into_iter().skip(page.saturating_mul(hits_per_page)).take(hits_per_page).collect();
+    SearchResults {
+        hits,
+        nb_hits,
+        page,
+        nb_pages: (nb_hits as usize).div_ceil(hits_per_page),
+        hits_per_page,
+        terms,
+    }
 }
 
 /// Records matching every word of `query`. An empty query matches everything.
