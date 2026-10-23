@@ -3,6 +3,7 @@
 
 pub mod facets;
 pub mod filter;
+pub mod highlight;
 pub mod index;
 pub mod ranking;
 pub mod search;

@@ -8,12 +8,15 @@
 
 use crate::facets::FacetCount;
 use crate::filter::{self, FilterError};
+use crate::highlight::{self, HighlightTags, Matcher};
 use crate::index::Index;
-use crate::ranking::{RankedDoc, rank};
+use crate::ranking::{RankingInfo, rank};
+use crate::store::DocId;
 use crate::tokenizer::tokenize;
 use crate::typo::{WordMatch, fuzzy_matches};
 use roaring::RoaringBitmap;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -73,6 +76,13 @@ pub struct SearchParams {
     pub page: usize,
     pub hits_per_page: usize,
     pub max_values_per_facet: usize,
+    /// Attributes to highlight; `None` (or `["*"]`) means all searchable ones.
+    pub attributes_to_highlight: Option<Vec<String>>,
+    /// Attributes to snippet, as `attribute` or `attribute:words`.
+    pub attributes_to_snippet: Vec<String>,
+    pub highlight_pre_tag: String,
+    pub highlight_post_tag: String,
+    pub snippet_ellipsis_text: String,
 }
 
 impl Default for SearchParams {
@@ -85,6 +95,11 @@ impl Default for SearchParams {
             page: 0,
             hits_per_page: 20,
             max_values_per_facet: 100,
+            attributes_to_highlight: None,
+            attributes_to_snippet: Vec::new(),
+            highlight_pre_tag: HighlightTags::default().pre,
+            highlight_post_tag: HighlightTags::default().post,
+            snippet_ellipsis_text: HighlightTags::default().ellipsis,
         }
     }
 }
@@ -96,9 +111,19 @@ impl SearchParams {
 }
 
 #[derive(Debug)]
+pub struct SearchHit {
+    pub doc: DocId,
+    pub info: RankingInfo,
+    /// Algolia's `_highlightResult`.
+    pub highlight: Map<String, Value>,
+    /// Algolia's `_snippetResult`.
+    pub snippet: Map<String, Value>,
+}
+
+#[derive(Debug)]
 pub struct SearchResults {
     /// The requested page of ranked records.
-    pub hits: Vec<RankedDoc>,
+    pub hits: Vec<SearchHit>,
     pub nb_hits: u64,
     pub page: usize,
     pub nb_pages: usize,
@@ -138,7 +163,30 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
 
     let ranked = rank(index, &terms, &candidates, &boosts);
     let nb_hits = candidates.len();
-    let hits = ranked.into_iter().skip(params.page.saturating_mul(hits_per_page)).take(hits_per_page).collect();
+    let page = ranked.into_iter().skip(params.page.saturating_mul(hits_per_page)).take(hits_per_page);
+
+    let matcher = Matcher::new(&terms);
+    let tags = HighlightTags {
+        pre: params.highlight_pre_tag.clone(),
+        post: params.highlight_post_tag.clone(),
+        ellipsis: params.snippet_ellipsis_text.clone(),
+    };
+    let to_highlight: Vec<String> = match &params.attributes_to_highlight {
+        Some(list) if list.iter().any(|a| a == "*") => index.attributes().to_vec(),
+        Some(list) => list.clone(),
+        None => index.attributes().to_vec(),
+    };
+    let hits = page
+        .map(|r| {
+            let record = index.store().get(r.doc).expect("ranked record is live");
+            SearchHit {
+                doc: r.doc,
+                info: r.info,
+                highlight: highlight::highlight(record, &to_highlight, &matcher, &tags),
+                snippet: highlight::snippet(record, &params.attributes_to_snippet, &matcher, &tags),
+            }
+        })
+        .collect();
     Ok(SearchResults {
         hits,
         nb_hits,
@@ -360,5 +408,36 @@ mod tests {
         .unwrap();
         assert_eq!((params.hits_per_page, params.page, params.max_values_per_facet), (5, 0, 100));
         assert_eq!(params.filters.as_deref(), Some("price < 50"));
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+    use crate::index::Settings;
+    use serde_json::json;
+
+    #[test]
+    fn hits_carry_highlights_and_snippets() {
+        let settings: Settings =
+            serde_json::from_value(json!({"searchableAttributes": ["title", "body"]})).unwrap();
+        let mut index = Index::new(settings);
+        index
+            .add(json!({"objectID": "1", "title": "Raft explained", "body": "Leaders, followers and the Raft log."}))
+            .unwrap();
+        let params = SearchParams {
+            attributes_to_highlight: Some(vec!["title".into()]),
+            attributes_to_snippet: vec!["body:3".into()],
+            ..SearchParams::new("raft")
+        };
+        let hit = &search(&index, &params).unwrap().hits[0];
+        assert_eq!(hit.highlight["title"]["value"], "<em>Raft</em> explained");
+        assert!(!hit.highlight.contains_key("body"));
+        assert_eq!(hit.snippet["body"]["value"], "… the <em>Raft</em> log");
+
+        // By default every searchable attribute is highlighted.
+        let hit = &search(&index, &SearchParams::new("log")).unwrap().hits[0];
+        assert_eq!(hit.highlight["body"]["value"], "Leaders, followers and the Raft <em>log</em>.");
+        assert_eq!(hit.highlight["title"]["matchLevel"], "none");
     }
 }

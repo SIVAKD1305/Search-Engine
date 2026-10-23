@@ -1,11 +1,13 @@
 //! Loads a JSON Lines file, builds the index and runs queries.
 //!
 //! Usage: search FILE.jsonl [--settings SETTINGS.json] [--filters F]
-//!               [--optional F]... [--facets a,b|*] [QUERY ...]
+//!               [--optional F]... [--facets a,b|*] [--snippet attr:N]... [QUERY ...]
+//!
+//! Matched words are shown between [ and ].
 //! With no queries on the command line, reads one query per line from stdin.
 
 use engine::index::{Index, Settings};
-use engine::search::{SearchParams, search};
+use engine::search::{SearchHit, SearchParams, search};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::time::Instant;
@@ -13,14 +15,23 @@ use std::time::Instant;
 const SHOWN: usize = 5;
 const RUNS: usize = 21;
 
-fn label(index: &Index, doc: u32) -> String {
-    let record = index.store().get(doc).expect("hit is live");
-    let text = ["name", "title"].iter().find_map(|k| record.get(*k).and_then(|v| v.as_str())).unwrap_or("");
+fn label(index: &Index, hit: &SearchHit) -> String {
+    let record = index.store().get(hit.doc).expect("hit is live");
+    let text = ["name", "title"]
+        .iter()
+        .find_map(|k| hit.highlight.get(*k).and_then(|h| h["value"].as_str()))
+        .unwrap_or("");
     format!("{:>6}  {text}", record["objectID"].as_str().unwrap_or(""))
 }
 
 fn run(index: &Index, base: &SearchParams, query: &str) {
-    let params = SearchParams { query: query.to_owned(), hits_per_page: SHOWN, ..base.clone() };
+    let params = SearchParams {
+        query: query.to_owned(),
+        hits_per_page: SHOWN,
+        highlight_pre_tag: "[".into(),
+        highlight_post_tag: "]".into(),
+        ..base.clone()
+    };
     let results = match search(index, &params) {
         Ok(results) => results,
         Err(e) => {
@@ -52,7 +63,7 @@ fn run(index: &Index, base: &SearchParams, query: &str) {
         let custom: Vec<String> = i.custom.iter().map(|v| v.map_or("-".into(), |v| v.to_string())).collect();
         println!(
             "  {:<44} {:>4} {:>5} {:>4} {:>4} {:<9.9} {:>5} {}",
-            label(index, hit.doc).chars().take(44).collect::<String>(),
+            label(index, hit).chars().take(44).collect::<String>(),
             i.nb_typos,
             i.words,
             i.filters,
@@ -61,6 +72,10 @@ fn run(index: &Index, base: &SearchParams, query: &str) {
             i.nb_exact_words,
             custom.join(",")
         );
+        for (attribute, snippet) in &hit.snippet {
+            let text = snippet["value"].as_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
+            println!("          {attribute}: {text}");
+        }
     }
     for (attribute, counts) in &results.facets {
         let shown: Vec<String> = counts.iter().take(6).map(|c| format!("{} ({})", c.value, c.count)).collect();
@@ -82,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("{file}: {e}"))?;
             }
             "--filters" => base.filters = Some(args.next().ok_or("--filters needs a value")?),
+            "--snippet" => base.attributes_to_snippet.push(args.next().ok_or("--snippet needs attr:N")?),
             "--optional" => base.optional_filters.push(args.next().ok_or("--optional needs a value")?),
             "--facets" => {
                 let list = args.next().ok_or("--facets needs a list")?;
@@ -91,7 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => queries.push(arg),
         }
     }
-    let path = path.ok_or("usage: search FILE.jsonl [--settings S.json] [--filters F] [--optional F] [--facets a,b|*] [QUERY ...]")?;
+    let path = path.ok_or(
+        "usage: search FILE.jsonl [--settings S.json] [--filters F] [--optional F] [--facets a,b|*] [--snippet attr:N] [QUERY ...]",
+    )?;
 
     let start = Instant::now();
     let mut index = Index::new(settings);

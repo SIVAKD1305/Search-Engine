@@ -11,10 +11,11 @@
    JSON settings with Algolia names, pagination, per-dataset configs in `config/`
 6. Filters (Algolia `filters` syntax: facets, numbers, ranges, AND/OR/NOT),
    facet counts, `filterOnly(...)`, `optionalFilters` and the `filters` criterion
+7. Highlighting (`_highlightResult`: typo- and prefix-aware, accent-safe,
+   HTML-escaped) and snippets (`_snippetResult`, best centered window)
 
 ## Next
 
-7. Highlighting and snippets
 8. HTTP API (Algolia-like JSON)
 9. Persistence to disk
 10. Plurals, synonyms, stop words, optional words
@@ -22,6 +23,10 @@
 
 ## Remember for later
 
+- Highlighting cost: highlighting long attributes (article bodies) adds about
+  1 ms for 5 hits. Snippet window search allocates a set per window; use a
+  sliding count instead. Consider highlighting only the snippet window when
+  an attribute is snippeted.
 - Facets not yet done: `facets_stats` (min/max/avg of numeric facets),
   searching inside facet values (`searchForFacetValues`), nested attributes
   (`brand.name`), and geo filters (`aroundLatLng`, the `geo` criterion).
