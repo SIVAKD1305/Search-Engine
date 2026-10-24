@@ -12,7 +12,7 @@
 //! 5. `exact`     — more words matched exactly (whole word, no typo) first
 //! 6. `custom`    — the index's own business metrics, e.g. `desc(rating)`
 
-use crate::index::{AttributeId, Hit, Index};
+use crate::index::{AttributeId, Hit, Index, WordId};
 use crate::search::QueryTerm;
 use crate::store::DocId;
 use roaring::RoaringBitmap;
@@ -112,6 +112,43 @@ struct TermInDoc {
     hits: Vec<Hit>,
 }
 
+/// Which dictionary words a query term matches, indexed by word id: one
+/// byte per word, 0 when the term does not match it, otherwise
+/// `1 | typos << 1 | exact << 3`. Built once per query, it turns "does this
+/// occurrence belong to the term?" into an array lookup.
+pub(crate) struct TermWords {
+    codes: Vec<u8>,
+}
+
+impl TermWords {
+    pub(crate) fn new(index: &Index, term: &QueryTerm) -> Self {
+        let mut codes = vec![0u8; index.word_id_limit()];
+        for m in &term.matches {
+            let Some(postings) = index.word(&m.word) else { continue };
+            let exact = m.typos == 0 && !m.prefix && !m.derived;
+            let code = 1 | (m.typos.min(3) << 1) | (u8::from(exact) << 3);
+            let slot = &mut codes[postings.id as usize];
+            *slot = match *slot {
+                0 => code,
+                old => {
+                    // Several matches of one word: fewest typos, exact if any is.
+                    let typos = ((old >> 1) & 3).min((code >> 1) & 3);
+                    1 | (typos << 1) | ((old | code) & 8)
+                }
+            };
+        }
+        TermWords { codes }
+    }
+
+    /// (typos, exact) when the term matches this word.
+    pub(crate) fn get(&self, word: WordId) -> Option<(u8, bool)> {
+        match self.codes.get(word as usize).copied().unwrap_or(0) {
+            0 => None,
+            code => Some(((code >> 1) & 3, code & 8 != 0)),
+        }
+    }
+}
+
 /// Sorts `candidates` by the index's ranking criteria. `boosts` are the
 /// record sets of the query's optional filters.
 pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boosts: &[RoaringBitmap]) -> Vec<RankedDoc> {
@@ -119,15 +156,15 @@ pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boos
     let n_terms = terms.len();
     let mut cells: Vec<TermInDoc> = vec![TermInDoc::default(); docs.len() * n_terms];
 
-    for (t, term) in terms.iter().enumerate() {
-        for m in &term.matches {
-            let Some(postings) = index.word(&m.word) else { continue };
-            for doc in &postings.docs & candidates {
-                let slot = docs.binary_search(&doc).expect("doc is a candidate");
+    let term_words: Vec<TermWords> = terms.iter().map(|t| TermWords::new(index, t)).collect();
+    for (slot, &doc) in docs.iter().enumerate() {
+        for occurrence in index.occurrences(doc) {
+            for (t, words) in term_words.iter().enumerate() {
+                let Some((typos, exact)) = words.get(occurrence.word) else { continue };
                 let cell = &mut cells[slot * n_terms + t];
-                cell.typos = Some(cell.typos.map_or(m.typos, |t| t.min(m.typos)));
-                cell.exact |= m.typos == 0 && !m.prefix && !m.derived;
-                cell.hits.extend_from_slice(&postings.hits[&doc]);
+                cell.typos = Some(cell.typos.map_or(typos, |old| old.min(typos)));
+                cell.exact |= exact;
+                cell.hits.push(occurrence.hit());
             }
         }
     }

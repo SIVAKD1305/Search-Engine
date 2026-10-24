@@ -229,6 +229,9 @@ mod tests {
             return; // datagen has not been run; nothing to check
         };
         for entry in entries.flatten() {
+            if entry.path().extension().is_none_or(|e| e != "jsonl") {
+                continue; // e.g. the data/scale directory
+            }
             let text = std::fs::read_to_string(entry.path()).unwrap();
             for line in text.lines().take(500) {
                 let record: Value = serde_json::from_str(line).unwrap();

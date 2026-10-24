@@ -15,7 +15,7 @@
 //! the order and `_rankingInfo` are exactly those of the full ranking.
 
 use crate::index::{Hit, Index};
-use crate::ranking::{Criterion, RankedDoc, pair_proximity, rank};
+use crate::ranking::{Criterion, RankedDoc, TermWords, pair_proximity, rank};
 use crate::search::QueryTerm;
 use crate::store::DocId;
 use roaring::RoaringBitmap;
@@ -78,6 +78,8 @@ struct Signals<'a> {
     exact_sets: Vec<RoaringBitmap>,
     /// For each term, the records matching it in each attribute.
     attribute_sets: Vec<Vec<RoaringBitmap>>,
+    /// Which words each term matches, for reading positions.
+    term_words: Vec<TermWords>,
     /// Proximity of records gathered so far.
     proximity: HashMap<DocId, u32>,
 }
@@ -123,7 +125,8 @@ impl<'a> Signals<'a> {
             exact_sets.push(exact);
             attribute_sets.push(by_attribute);
         }
-        Signals { index, terms, boosts, typo_sets, exact_sets, attribute_sets, proximity: HashMap::new() }
+        let term_words = if terms.len() >= 2 { terms.iter().map(|t| TermWords::new(index, t)).collect() } else { Vec::new() };
+        Signals { index, terms, boosts, typo_sets, exact_sets, attribute_sets, term_words, proximity: HashMap::new() }
     }
 
     fn typos(&self, doc: DocId) -> u64 {
@@ -150,26 +153,22 @@ impl<'a> Signals<'a> {
     /// Computes proximity for the records of `group` not seen yet. Needs at
     /// least two terms.
     fn gather(&mut self, group: &[DocId]) {
-        let missing: RoaringBitmap = group.iter().copied().filter(|d| !self.proximity.contains_key(d)).collect();
-        if missing.is_empty() {
-            return;
-        }
         let n_terms = self.terms.len();
-        let mut hits: HashMap<DocId, Vec<Vec<Hit>>> = HashMap::new();
-        for (t, term) in self.terms.iter().enumerate() {
-            for m in &term.matches {
-                let Some(postings) = self.index.word(&m.word) else { continue };
-                for doc in &postings.docs & &missing {
-                    hits.entry(doc).or_insert_with(|| vec![Vec::new(); n_terms])[t]
-                        .extend_from_slice(&postings.hits[&doc]);
-                }
+        let mut row: Vec<Vec<Hit>> = vec![Vec::new(); n_terms];
+        for &doc in group {
+            if self.proximity.contains_key(&doc) {
+                continue;
             }
-        }
-        for doc in &missing {
-            let mut row = hits.remove(&doc).unwrap_or_else(|| vec![Vec::new(); n_terms]);
-            for term_hits in &mut row {
-                term_hits.sort_unstable_by_key(|h| (h.attribute, h.position));
-                term_hits.dedup();
+            for hits in &mut row {
+                hits.clear();
+            }
+            // Occurrences are in reading order, so each term's hits come out sorted.
+            for occurrence in self.index.occurrences(doc) {
+                for (t, words) in self.term_words.iter().enumerate() {
+                    if words.get(occurrence.word).is_some() {
+                        row[t].push(occurrence.hit());
+                    }
+                }
             }
             let proximity = row.windows(2).map(|pair| pair_proximity(&pair[0], &pair[1])).sum();
             self.proximity.insert(doc, proximity);

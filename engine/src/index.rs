@@ -2,9 +2,12 @@
 //!
 //! Two structures, following Algolia's design:
 //!
-//! - `words`: a sorted dictionary from each full word to its postings — which
-//!   records contain it, and in which attribute and position. Ranking reads
-//!   these hits.
+//! - `words`: a sorted dictionary from each full word to its postings: the
+//!   records containing it, overall and per attribute.
+//! - `occurrences`: for each record, every word it contains with its
+//!   attribute and position, in reading order. Proximity and highlighting
+//!   ranks read these; a record has a few dozen, so looking up the words of a
+//!   prefix that matches thousands of words stays cheap.
 //! - `prefixes`: for every prefix of every word ("h", "he", "hea", ...) the set
 //!   of records containing a word that starts with it. This costs memory but
 //!   makes search-as-you-type a single lookup instead of a union over every
@@ -33,13 +36,29 @@ pub struct Hit {
     pub position: u32,
 }
 
-#[derive(Debug, Default)]
+/// A dictionary word's permanent number; ids of removed words are not reused.
+pub type WordId = u32;
+
+#[derive(Debug)]
 pub struct Postings {
+    pub id: WordId,
     pub docs: RoaringBitmap,
-    /// Hits per record, sorted by (attribute, position).
-    pub hits: HashMap<DocId, Vec<Hit>>,
     /// Records containing the word in each attribute (indexed by AttributeId).
     pub by_attribute: Vec<RoaringBitmap>,
+}
+
+/// One word of a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Occurrence {
+    pub word: WordId,
+    pub attribute: AttributeId,
+    pub position: u32,
+}
+
+impl Occurrence {
+    pub fn hit(&self) -> Hit {
+        Hit { attribute: self.attribute, position: self.position }
+    }
 }
 
 /// Records containing a word that starts with a given prefix.
@@ -110,6 +129,9 @@ pub struct Index {
     /// One column per `customRanking` rule: the rule's value for each DocId
     /// (NaN when missing), so ranking never reads record JSON.
     custom_columns: Vec<Vec<f64>>,
+    /// Each record's words, sorted by (attribute, position); indexed by DocId.
+    occurrences: Vec<Vec<Occurrence>>,
+    next_word_id: WordId,
 }
 
 impl Index {
@@ -209,6 +231,16 @@ impl Index {
         self.prefixes.get(prefix).map(|p| &p.docs)
     }
 
+    /// A record's words in reading order (empty for deleted records).
+    pub fn occurrences(&self, doc: DocId) -> &[Occurrence] {
+        self.occurrences.get(doc as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// One more than the largest word id handed out so far.
+    pub fn word_id_limit(&self) -> usize {
+        self.next_word_id as usize
+    }
+
     /// Records containing a word that starts with `prefix`, per attribute.
     pub fn prefix_docs_by_attribute(&self, prefix: &str) -> &[RoaringBitmap] {
         self.prefixes.get(prefix).map_or(&[], |p| p.by_attribute.as_slice())
@@ -255,7 +287,7 @@ impl Index {
             records: self.store.len(),
             words: self.words.len(),
             prefixes: self.prefixes.len(),
-            hits: self.words.values().flat_map(|p| p.hits.values()).map(Vec::len).sum(),
+            hits: self.occurrences.iter().map(Vec::len).sum(),
         }
     }
 
@@ -328,15 +360,25 @@ impl Index {
                 insert_in_attribute(&mut entry.by_attribute, attribute, id);
             }
         }
-        for (word, mut word_hits) in hits {
-            word_hits.sort_unstable_by_key(|h| (h.attribute, h.position));
-            let postings = self.words.entry(word).or_default();
+        let mut occurrences = Vec::with_capacity(hits.values().map(Vec::len).sum());
+        for (word, word_hits) in hits {
+            if !self.words.contains_key(&word) {
+                let postings = Postings { id: self.next_word_id, docs: RoaringBitmap::new(), by_attribute: Vec::new() };
+                self.next_word_id += 1;
+                self.words.insert(word.clone(), postings);
+            }
+            let postings = self.words.get_mut(&word).expect("just ensured");
             postings.docs.insert(id);
             for h in &word_hits {
                 insert_in_attribute(&mut postings.by_attribute, h.attribute, id);
+                occurrences.push(Occurrence { word: postings.id, attribute: h.attribute, position: h.position });
             }
-            postings.hits.insert(id, word_hits);
         }
+        occurrences.sort_unstable_by_key(|o| (o.attribute, o.position));
+        if self.occurrences.len() <= id as usize {
+            self.occurrences.resize_with(id as usize + 1, Vec::new);
+        }
+        self.occurrences[id as usize] = occurrences;
     }
 
     /// Removes a record's postings. The old record is re-tokenized to find its
@@ -350,6 +392,9 @@ impl Index {
         }
         self.facets.remove(id, old);
         self.numbers.remove(id, old);
+        if let Some(list) = self.occurrences.get_mut(id as usize) {
+            *list = Vec::new();
+        }
         let mut words = HashSet::new();
         for (_, value) in self.searchable_fields(old) {
             words.extend(tokenize_value(value).into_iter().map(|t| t.text));
@@ -361,7 +406,6 @@ impl Index {
             prefixes.extend(prefixes_of(word));
             if let Some(postings) = self.words.get_mut(word) {
                 postings.docs.remove(id);
-                postings.hits.remove(&id);
                 for set in &mut postings.by_attribute {
                     set.remove(id);
                 }
@@ -421,8 +465,11 @@ mod tests {
         let index = sample();
         let wireless = index.word("wireless").unwrap();
         assert_eq!(ids(&wireless.docs), [0, 1]);
-        assert_eq!(wireless.hits[&0], [Hit { attribute: 0, position: 0 }]);
-        assert_eq!(wireless.hits[&1], [Hit { attribute: 1, position: 1 }]);
+        let hits_of = |doc| -> Vec<Hit> {
+            index.occurrences(doc).iter().filter(|o| o.word == wireless.id).map(Occurrence::hit).collect()
+        };
+        assert_eq!(hits_of(0), [Hit { attribute: 0, position: 0 }]);
+        assert_eq!(hits_of(1), [Hit { attribute: 1, position: 1 }]);
         // Only searchable attributes are indexed.
         assert!(index.word("99").is_none());
     }
@@ -472,8 +519,11 @@ mod tests {
     fn repeated_words_keep_every_position() {
         let mut index = Index::new(Settings::default());
         index.add(json!({"objectID": "1", "body": "fast and fast again"})).unwrap();
-        let hits = &index.word("fast").unwrap().hits[&0];
-        assert_eq!(hits.iter().map(|h| h.position).collect::<Vec<_>>(), [0, 2]);
+        let fast = index.word("fast").unwrap().id;
+        let positions: Vec<u32> = index.occurrences(0).iter().filter(|o| o.word == fast).map(|o| o.position).collect();
+        assert_eq!(positions, [0, 2]);
+        // Every word of the record, in reading order.
+        assert_eq!(index.occurrences(0).iter().map(|o| o.position).collect::<Vec<_>>(), [0, 1, 2, 3]);
         assert_eq!(index.stats().hits, 4);
     }
 
