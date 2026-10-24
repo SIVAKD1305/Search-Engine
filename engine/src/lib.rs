@@ -5,9 +5,11 @@ pub mod facets;
 pub mod filter;
 pub mod highlight;
 pub mod index;
+pub mod language;
 pub mod ranking;
 pub mod search;
 pub mod store;
+pub mod synonyms;
 pub mod tokenizer;
 pub mod typo;
 

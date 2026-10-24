@@ -350,6 +350,9 @@ fn run_search(index: &Index, params: &SearchParams, options: &ResponseOptions) -
     if !params.facets.is_empty() {
         response["facets"] = Value::Object(facets);
     }
+    if let Some(query) = &results.query_after_removal {
+        response["queryAfterRemoval"] = json!(query);
+    }
     Ok(response)
 }
 

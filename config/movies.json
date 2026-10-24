@@ -1,5 +1,8 @@
 {
   "searchableAttributes": ["title", "actors", "director", "genres", "overview"],
   "attributesForFaceting": ["genres", "director", "filterOnly(actors)"],
-  "customRanking": ["desc(votes)", "desc(rating)"]
+  "customRanking": ["desc(votes)", "desc(rating)"],
+  "ignorePlurals": true,
+  "removeWordsIfNoResults": "lastWords",
+  "synonyms": [{"type": "synonym", "synonyms": ["scifi", "science"]}]
 }

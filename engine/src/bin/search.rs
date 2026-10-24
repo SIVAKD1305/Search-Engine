@@ -49,6 +49,9 @@ fn run(index: &Index, base: &SearchParams, query: &str) {
         .collect();
     times.sort_by(f64::total_cmp);
     println!("\n\"{query}\": {} hits in {:.3} ms (median of {RUNS})", results.nb_hits, times[RUNS / 2]);
+    if let Some(after) = &results.query_after_removal {
+        println!("  no results for every word; searched as: {after}");
+    }
     for term in &results.terms {
         let shown: Vec<String> =
             term.matches.iter().take(4).map(|m| format!("{} ({} typo)", m.word, m.typos)).collect();

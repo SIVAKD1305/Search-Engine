@@ -14,6 +14,8 @@ use crate::store::{DocId, DocumentStore, StoreError};
 use crate::tokenizer::tokenize_value;
 use crate::facets::{FacetAttribute, FacetCount, FacetIndex, NumericIndex};
 use crate::ranking::{CustomRule, Ranking};
+use crate::search::RemoveWords;
+use crate::synonyms::{self, Synonym};
 use crate::typo::TypoSettings;
 use serde::{Deserialize, Serialize};
 use roaring::RoaringBitmap;
@@ -54,6 +56,16 @@ pub struct Settings {
     pub custom_ranking: Vec<CustomRule>,
     /// Attributes usable in facet filters and facet counts.
     pub attributes_for_faceting: Vec<FacetAttribute>,
+    /// Treat English singular and plural forms as the same word.
+    pub ignore_plurals: bool,
+    /// Drop common English words ("the", "of", ...) from queries.
+    pub remove_stop_words: bool,
+    /// What to do when no record matches every query word.
+    pub remove_words_if_no_results: RemoveWords,
+    /// Query words that are not required to match.
+    pub optional_words: Vec<String>,
+    /// Algolia keeps synonyms in a separate API; here they are a setting.
+    pub synonyms: Vec<Synonym>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,13 +87,16 @@ pub struct Index {
     numbers: NumericIndex,
     /// Ids of all live records.
     live: RoaringBitmap,
+    /// Normalized word -> words it can stand for, from `settings.synonyms`.
+    synonym_map: HashMap<String, Vec<String>>,
 }
 
 impl Index {
     pub fn new(settings: Settings) -> Self {
         let attributes = settings.searchable_attributes.clone().unwrap_or_default();
         let facets = FacetIndex::new(&settings.attributes_for_faceting);
-        Index { settings, attributes, facets, ..Default::default() }
+        let synonym_map = synonyms::build_map(&settings.synonyms);
+        Index { settings, attributes, facets, synonym_map, ..Default::default() }
     }
 
     pub fn store(&self) -> &DocumentStore {
@@ -90,6 +105,11 @@ impl Index {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Words that `word` (normalized) can stand for.
+    pub fn synonyms_of(&self, word: &str) -> &[String] {
+        self.synonym_map.get(word).map_or(&[], Vec::as_slice)
     }
 
     /// The sorted word dictionary, for typo-tolerant lookups.

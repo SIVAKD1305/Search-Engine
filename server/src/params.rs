@@ -20,7 +20,7 @@ pub struct ResponseOptions {
 
 const STRING_KEYS: &[&str] = &["query", "filters", "highlightPreTag", "highlightPostTag", "snippetEllipsisText"];
 const LIST_KEYS: &[&str] =
-    &["facets", "optionalFilters", "attributesToHighlight", "attributesToSnippet", "attributesToRetrieve"];
+    &["facets", "optionalFilters", "optionalWords", "attributesToHighlight", "attributesToSnippet", "attributesToRetrieve"];
 
 /// Converts one URL-encoded value to the JSON type its key expects.
 fn convert(key: &str, raw: &str) -> Value {

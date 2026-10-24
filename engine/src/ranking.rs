@@ -127,7 +127,7 @@ pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boos
                 let slot = docs.binary_search(&doc).expect("doc is a candidate");
                 let cell = &mut cells[slot * n_terms + t];
                 cell.typos = Some(cell.typos.map_or(m.typos, |t| t.min(m.typos)));
-                cell.exact |= m.typos == 0 && !m.prefix;
+                cell.exact |= m.typos == 0 && !m.prefix && !m.derived;
                 cell.hits.extend_from_slice(&postings.hits[&doc]);
             }
         }

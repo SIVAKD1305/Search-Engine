@@ -54,6 +54,9 @@ pub struct WordMatch {
     pub typos: u8,
     /// True when the query matched only the start of `word` (search-as-you-type).
     pub prefix: bool,
+    /// True for another form of the query word (plural, synonym): no typo,
+    /// but not an exact match either.
+    pub derived: bool,
 }
 
 /// Finds dictionary words within `max_typos` of `query`.
@@ -132,7 +135,7 @@ pub fn fuzzy_matches<V>(
         let first_letter_penalty = u32::from(query.first() != chars.first());
         let typos = distance + if distance > 0 { first_letter_penalty } else { 0 };
         if typos <= limit {
-            matches.push(WordMatch { word: key.to_owned(), typos: typos as u8, prefix: is_prefix });
+            matches.push(WordMatch { word: key.to_owned(), typos: typos as u8, prefix: is_prefix, derived: false });
         }
     }
     matches
@@ -142,7 +145,7 @@ fn exact_matches<V>(dictionary: &BTreeMap<String, V>, query: &str, prefix: bool)
     if !prefix {
         return dictionary
             .get_key_value(query)
-            .map(|(w, _)| WordMatch { word: w.clone(), typos: 0, prefix: false })
+            .map(|(w, _)| WordMatch { word: w.clone(), typos: 0, prefix: false, derived: false })
             .into_iter()
             .collect();
     }
@@ -150,7 +153,7 @@ fn exact_matches<V>(dictionary: &BTreeMap<String, V>, query: &str, prefix: bool)
         .range::<str, _>((Bound::Included(query), Bound::Unbounded))
         .map(|(w, _)| w)
         .take_while(|w| w.starts_with(query))
-        .map(|w| WordMatch { word: w.clone(), typos: 0, prefix: w.len() > query.len() })
+        .map(|w| WordMatch { word: w.clone(), typos: 0, prefix: w.len() > query.len(), derived: false })
         .collect()
 }
 

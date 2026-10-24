@@ -1,38 +1,105 @@
 //! Query execution: matching with typo tolerance, filters, facets and ranking.
 //!
 //! Each query word is expanded into the dictionary words it can stand for:
-//! itself, words within the allowed number of typos, and — for the last word,
-//! which the user may still be typing — words that start with it (Algolia's
-//! default `queryType: prefixLast`). A record matches when every query word
-//! matches at least one of its expansions.
+//! itself, words within the allowed number of typos, its plural or singular
+//! (`ignorePlurals`), its synonyms, and — for the last word, which the user
+//! may still be typing — words that start with it (Algolia's default
+//! `queryType: prefixLast`). A record matches when every required query word
+//! matches at least one of its expansions; `optionalWords` and
+//! `removeWordsIfNoResults` relax that.
 
 use crate::facets::FacetCount;
 use crate::filter::{self, FilterError};
 use crate::highlight::{self, HighlightTags, Matcher};
-use crate::index::Index;
+use crate::index::{Index, Settings};
+use crate::language::{is_stop_word, plural_forms};
 use crate::ranking::{RankingInfo, rank};
 use crate::store::DocId;
-use crate::tokenizer::tokenize;
+use crate::tokenizer::{normalize, tokenize};
 use crate::typo::{WordMatch, fuzzy_matches};
 use roaring::RoaringBitmap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug)]
 pub struct QueryTerm {
     /// Normalized query word.
     pub text: String,
     pub is_prefix: bool,
+    /// Records may match without this word; it only helps ranking.
+    pub optional: bool,
     /// Dictionary words this term can match, fewest typos first.
     pub matches: Vec<WordMatch>,
     /// Records containing at least one of `matches`.
     pub docs: RoaringBitmap,
 }
 
-/// Expands every query word into its matching dictionary words.
+/// Algolia's `removeWordsIfNoResults`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoveWords {
+    /// Return no results.
+    #[default]
+    None,
+    /// Drop words from the end of the query until something matches.
+    LastWords,
+    /// Drop words from the start of the query until something matches.
+    FirstWords,
+    /// Make every word optional; records matching more words rank higher.
+    AllOptional,
+}
+
+/// How query words are expanded: the index settings, possibly overridden
+/// by the search request.
+#[derive(Debug, Clone, Default)]
+pub struct QueryOptions {
+    pub ignore_plurals: bool,
+    pub synonyms: bool,
+    pub remove_stop_words: bool,
+    /// Normalized optional words.
+    pub optional_words: HashSet<String>,
+}
+
+impl QueryOptions {
+    pub fn from_settings(settings: &Settings) -> Self {
+        QueryOptions {
+            ignore_plurals: settings.ignore_plurals,
+            synonyms: true,
+            remove_stop_words: settings.remove_stop_words,
+            optional_words: settings.optional_words.iter().map(|w| normalize(w)).collect(),
+        }
+    }
+
+    fn for_request(settings: &Settings, params: &SearchParams) -> Self {
+        let mut options = QueryOptions::from_settings(settings);
+        options.ignore_plurals = params.ignore_plurals.unwrap_or(options.ignore_plurals);
+        options.synonyms = params.synonyms.unwrap_or(true);
+        options.remove_stop_words = params.remove_stop_words.unwrap_or(options.remove_stop_words);
+        if let Some(words) = &params.optional_words {
+            options.optional_words = words.iter().map(|w| normalize(w)).collect();
+        }
+        options
+    }
+}
+
+/// Expands every query word, using the index settings.
 pub fn plan(index: &Index, query: &str) -> Vec<QueryTerm> {
-    let tokens = tokenize(query);
+    plan_with(index, query, &QueryOptions::from_settings(index.settings()))
+}
+
+pub fn plan_with(index: &Index, query: &str, options: &QueryOptions) -> Vec<QueryTerm> {
+    let mut tokens = tokenize(query);
+    let last = tokens.len().saturating_sub(1);
+    if options.remove_stop_words {
+        // The last word is kept: the user may still be typing a longer word.
+        let mut i = 0;
+        tokens.retain(|t| {
+            let keep = i == last || !is_stop_word(&t.text);
+            i += 1;
+            keep
+        });
+    }
     let last = tokens.len().saturating_sub(1);
     tokens
         .into_iter()
@@ -41,20 +108,42 @@ pub fn plan(index: &Index, query: &str) -> Vec<QueryTerm> {
             let is_prefix = i == last;
             let max_typos = index.settings().typo.max_typos(token.text.chars().count());
             let mut matches = fuzzy_matches(index.dictionary(), &token.text, max_typos, is_prefix);
+
+            let mut alternatives: Vec<String> = Vec::new();
+            if options.ignore_plurals {
+                alternatives.extend(plural_forms(&token.text));
+            }
+            if options.synonyms {
+                alternatives.extend(index.synonyms_of(&token.text).iter().cloned());
+            }
+            for word in alternatives {
+                if word == token.text || index.word(&word).is_none() {
+                    continue;
+                }
+                // A plural found as a typo or prefix match counts as no typo.
+                matches.retain(|m| m.word != word);
+                matches.push(WordMatch { word, typos: 0, prefix: false, derived: true });
+            }
+
             matches.sort_by(|a, b| a.typos.cmp(&b.typos).then_with(|| a.word.cmp(&b.word)));
             let docs = term_docs(index, &token.text, is_prefix, max_typos, &matches);
-            QueryTerm { text: token.text, is_prefix, matches, docs }
+            let optional = options.optional_words.contains(&token.text);
+            QueryTerm { text: token.text, is_prefix, optional, matches, docs }
         })
         .collect()
 }
 
 fn term_docs(index: &Index, text: &str, is_prefix: bool, max_typos: u8, matches: &[WordMatch]) -> RoaringBitmap {
-    // Exact prefix: one precomputed set instead of a union over every word.
-    if is_prefix && max_typos == 0 {
-        return index.prefix_docs(text).cloned().unwrap_or_default();
-    }
     let mut docs = RoaringBitmap::new();
+    // Exact prefix: one precomputed set instead of a union over every word.
+    let fast_prefix = is_prefix && max_typos == 0;
+    if fast_prefix {
+        docs = index.prefix_docs(text).cloned().unwrap_or_default();
+    }
     for m in matches {
+        if fast_prefix && !m.derived {
+            continue;
+        }
         if let Some(postings) = index.word(&m.word) {
             docs |= &postings.docs;
         }
@@ -83,6 +172,28 @@ pub struct SearchParams {
     pub highlight_pre_tag: String,
     pub highlight_post_tag: String,
     pub snippet_ellipsis_text: String,
+    // The following override the index settings of the same name.
+    pub ignore_plurals: Option<bool>,
+    pub remove_stop_words: Option<bool>,
+    /// `false` turns synonyms off for this request.
+    pub synonyms: Option<bool>,
+    pub remove_words_if_no_results: Option<RemoveWords>,
+    /// A list, or one string of words separated by spaces or commas.
+    #[serde(deserialize_with = "words_list")]
+    pub optional_words: Option<Vec<String>>,
+}
+
+fn words_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Words {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(Option::<Words>::deserialize(deserializer)?.map(|words| match words {
+        Words::One(s) => s.split([' ', ',']).filter(|w| !w.is_empty()).map(str::to_owned).collect(),
+        Words::Many(list) => list,
+    }))
 }
 
 impl Default for SearchParams {
@@ -100,6 +211,11 @@ impl Default for SearchParams {
             highlight_pre_tag: HighlightTags::default().pre,
             highlight_post_tag: HighlightTags::default().post,
             snippet_ellipsis_text: HighlightTags::default().ellipsis,
+            ignore_plurals: None,
+            remove_stop_words: None,
+            synonyms: None,
+            remove_words_if_no_results: None,
+            optional_words: None,
         }
     }
 }
@@ -130,17 +246,69 @@ pub struct SearchResults {
     pub hits_per_page: usize,
     /// Value counts per requested facet, over all hits (not just this page).
     pub facets: BTreeMap<String, Vec<FacetCount>>,
+    /// The query words used, after any removal.
     pub terms: Vec<QueryTerm>,
+    /// Set when words were removed: the query with removed words wrapped
+    /// in the highlight tags (Algolia's `queryAfterRemoval`).
+    pub query_after_removal: Option<String>,
 }
 
 /// Runs a query and returns one page (0-based) of ranked results.
 pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, FilterError> {
     let hits_per_page = params.hits_per_page.max(1);
-    let terms = plan(index, &params.query);
-    let mut candidates = intersect(index, &terms);
-    if let Some(filters) = params.filters.as_deref().filter(|f| !f.trim().is_empty()) {
-        candidates &= filter::parse(filters)?.evaluate(index)?;
+    let options = QueryOptions::for_request(index.settings(), params);
+    let mut terms = plan_with(index, &params.query, &options);
+    let filtered = match params.filters.as_deref().filter(|f| !f.trim().is_empty()) {
+        Some(filters) => Some(filter::parse(filters)?.evaluate(index)?),
+        None => None,
+    };
+    let apply_filters = |mut docs: RoaringBitmap| {
+        if let Some(f) = &filtered {
+            docs &= f;
+        }
+        docs
+    };
+    let mut candidates = apply_filters(matching(index, &terms));
+
+    let strategy = params.remove_words_if_no_results.unwrap_or(index.settings().remove_words_if_no_results);
+    let mut removed: Vec<String> = Vec::new();
+    if candidates.is_empty() && !terms.is_empty() {
+        match strategy {
+            RemoveWords::None => {}
+            RemoveWords::AllOptional => {
+                for term in &mut terms {
+                    term.optional = true;
+                }
+                candidates = apply_filters(matching(index, &terms));
+            }
+            RemoveWords::LastWords | RemoveWords::FirstWords => {
+                while candidates.is_empty() && terms.iter().filter(|t| !t.optional).count() > 1 {
+                    let position = if strategy == RemoveWords::LastWords {
+                        terms.iter().rposition(|t| !t.optional)
+                    } else {
+                        terms.iter().position(|t| !t.optional)
+                    };
+                    let term = terms.remove(position.expect("a required term exists"));
+                    removed.push(term.text);
+                    candidates = apply_filters(matching(index, &terms));
+                }
+            }
+        }
     }
+    let query_after_removal = (!removed.is_empty()).then(|| {
+        tokenize(&params.query)
+            .iter()
+            .map(|t| {
+                let original = &params.query[t.start..t.end];
+                if removed.contains(&t.text) {
+                    format!("{}{original}{}", params.highlight_pre_tag, params.highlight_post_tag)
+                } else {
+                    original.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
     let boosts = params
         .optional_filters
         .iter()
@@ -195,20 +363,31 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
         hits_per_page,
         facets,
         terms,
+        query_after_removal,
     })
 }
 
 /// Records matching every word of `query`. An empty query matches everything.
 pub fn candidates(index: &Index, query: &str) -> RoaringBitmap {
-    intersect(index, &plan(index, query))
+    matching(index, &plan(index, query))
 }
 
-pub fn intersect(index: &Index, terms: &[QueryTerm]) -> RoaringBitmap {
+/// Records matching every required term. If every term is optional, records
+/// matching at least one term.
+pub fn matching(index: &Index, terms: &[QueryTerm]) -> RoaringBitmap {
     if terms.is_empty() {
         return index.all_docs();
     }
+    let required: Vec<&QueryTerm> = terms.iter().filter(|t| !t.optional).collect();
+    if required.is_empty() {
+        let mut union = RoaringBitmap::new();
+        for term in terms {
+            union |= &term.docs;
+        }
+        return union;
+    }
     // Intersect the smallest sets first so the working set shrinks quickly.
-    let mut sets: Vec<&RoaringBitmap> = terms.iter().map(|t| &t.docs).collect();
+    let mut sets: Vec<&RoaringBitmap> = required.iter().map(|t| &t.docs).collect();
     sets.sort_unstable_by_key(|docs| docs.len());
     let mut result = sets[0].clone();
     for docs in &sets[1..] {
@@ -439,5 +618,154 @@ mod highlight_tests {
         let hit = &search(&index, &SearchParams::new("log")).unwrap().hits[0];
         assert_eq!(hit.highlight["body"]["value"], "Leaders, followers and the Raft <em>log</em>.");
         assert_eq!(hit.highlight["title"]["matchLevel"], "none");
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn shop(extra: Value) -> Index {
+        let mut settings = json!({"searchableAttributes": ["name", "description"], "customRanking": ["desc(rating)"]});
+        settings.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let mut index = Index::new(serde_json::from_value(settings).unwrap());
+        for r in [
+            json!({"objectID": "1", "name": "Wireless Headphones", "rating": 4}),
+            json!({"objectID": "2", "name": "Headphone Stand", "rating": 5}),
+            json!({"objectID": "3", "name": "Television 55 inch", "rating": 3}),
+            json!({"objectID": "4", "name": "Smartphone Case", "rating": 2}),
+            json!({"objectID": "5", "name": "Lamp", "description": "The light of the house", "rating": 1}),
+            json!({"objectID": "6", "name": "Battery Pack", "rating": 1}),
+        ] {
+            index.add(r).unwrap();
+        }
+        index
+    }
+
+    fn run(index: &Index, params: SearchParams) -> (Vec<String>, SearchResults) {
+        let results = search(index, &params).unwrap();
+        let ids = results
+            .hits
+            .iter()
+            .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+            .collect();
+        (ids, results)
+    }
+
+    fn ids(index: &Index, query: &str) -> Vec<String> {
+        run(index, SearchParams::new(query)).0
+    }
+
+    #[test]
+    fn plurals_match_without_counting_as_typos_or_exact() {
+        let index = shop(json!({"ignorePlurals": true}));
+        let (found, results) = run(&index, SearchParams::new("headphone stand"));
+        assert_eq!(found, ["2"]);
+        let (found, results2) = run(&index, SearchParams::new("headphone "));
+        assert_eq!(found, ["2", "1"]);
+        // "headphones" is a plural, not a typo, and not an exact match.
+        let hit = results2.hits.iter().find(|h| h.doc == 0).unwrap();
+        assert_eq!((hit.info.nb_typos, hit.info.nb_exact_words), (0, 0));
+        assert_eq!(ids(&index, "batteries"), ["6"]);
+        assert!(results.query_after_removal.is_none());
+        // Off by default, and per request.
+        assert!(ids(&shop(json!({})), "batteries").is_empty());
+        let (found, _) = run(&index, SearchParams { ignore_plurals: Some(false), ..SearchParams::new("batteries") });
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn synonyms_expand_query_words_and_are_highlighted() {
+        let index = shop(json!({"synonyms": [
+            {"type": "synonym", "synonyms": ["tv", "television"]},
+            {"type": "oneWaySynonym", "input": "phone", "synonyms": ["smartphone"]}
+        ]}));
+        let (found, results) = run(&index, SearchParams::new("tv"));
+        assert_eq!(found, ["3"]);
+        assert_eq!(results.hits[0].highlight["name"]["value"], "<em>Television</em> 55 inch");
+        assert_eq!(ids(&index, "phone case"), ["4"]);
+        // One-way: "smartphone" does not find "phone".
+        assert_eq!(ids(&index, "smartphone"), ["4"]);
+        let (found, _) = run(&index, SearchParams { synonyms: Some(false), ..SearchParams::new("tv") });
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn stop_words_are_removed_except_the_last_word() {
+        let index = shop(json!({"removeStopWords": true}));
+        assert_eq!(ids(&index, "the light of house"), ["5"]);
+        // Without removal, "of" and "the" must match too (they do here).
+        assert_eq!(ids(&shop(json!({})), "the light of house"), ["5"]);
+        // "the" is not in any name, so it would exclude everything.
+        assert_eq!(ids(&index, "the lamp"), ["5"]);
+        assert!(ids(&shop(json!({})), "the wireless").is_empty());
+        assert_eq!(ids(&index, "the wireless"), ["1"]);
+        // A trailing stop word is kept as a prefix ("the" could become "theater").
+        assert!(ids(&index, "wireless the").is_empty());
+    }
+
+    #[test]
+    fn remove_words_if_no_results_strategies() {
+        let index = shop(json!({}));
+        assert!(ids(&index, "wireless headphones toaster").is_empty());
+
+        let last = SearchParams { remove_words_if_no_results: Some(RemoveWords::LastWords), ..SearchParams::new("wireless headphones toaster") };
+        let (found, results) = run(&index, last);
+        assert_eq!(found, ["1"]);
+        assert_eq!(results.query_after_removal.as_deref(), Some("wireless headphones <em>toaster</em>"));
+        assert_eq!(results.terms.len(), 2);
+
+        let first = SearchParams { remove_words_if_no_results: Some(RemoveWords::FirstWords), ..SearchParams::new("toaster battery pack") };
+        let (found, results) = run(&index, first);
+        assert_eq!(found, ["6"]);
+        assert_eq!(results.query_after_removal.as_deref(), Some("<em>toaster</em> battery pack"));
+
+        // allOptional: more matched words rank first.
+        let all = SearchParams { remove_words_if_no_results: Some(RemoveWords::AllOptional), ..SearchParams::new("wireless stand toaster") };
+        let (found, results) = run(&index, all);
+        assert_eq!(found, ["2", "1"]);
+        assert_eq!(results.hits[0].info.words, 1);
+
+        // The setting applies when the request does not override it.
+        let index = shop(json!({"removeWordsIfNoResults": "lastWords"}));
+        assert_eq!(ids(&index, "lamp toaster"), ["5"]);
+        // A query that already matches is never changed.
+        let (_, results) = run(&index, SearchParams::new("lamp"));
+        assert!(results.query_after_removal.is_none());
+    }
+
+    #[test]
+    fn optional_words_boost_but_are_not_required() {
+        let index = shop(json!({"optionalWords": ["wireless"]}));
+        assert_eq!(ids(&index, "wireless headphone "), ["1", "2"]);
+        let (_, results) = run(&index, SearchParams::new("wireless headphone "));
+        assert_eq!(results.hits[0].info.words, 2);
+        assert_eq!(results.hits[1].info.words, 1);
+        let (found, _) = run(&index, SearchParams { optional_words: Some(vec![]), ..SearchParams::new("wireless headphone ") });
+        assert_eq!(found, ["1"]);
+    }
+
+    #[test]
+    fn optional_words_accept_a_string_or_a_list() {
+        let p: SearchParams = serde_json::from_value(json!({"optionalWords": "new, york city"})).unwrap();
+        assert_eq!(p.optional_words.unwrap(), ["new", "york", "city"]);
+        let p: SearchParams = serde_json::from_value(json!({"optionalWords": ["a b"]})).unwrap();
+        assert_eq!(p.optional_words.unwrap(), ["a b"]);
+        let p: SearchParams = serde_json::from_value(json!({})).unwrap();
+        assert!(p.optional_words.is_none());
+    }
+
+    #[test]
+    fn new_settings_round_trip_with_algolia_names() {
+        let settings: Settings = serde_json::from_value(json!({
+            "ignorePlurals": true, "removeStopWords": true, "removeWordsIfNoResults": "allOptional",
+            "optionalWords": ["new"], "synonyms": [{"type": "synonym", "synonyms": ["a1", "b1"]}]
+        }))
+        .unwrap();
+        let back = serde_json::to_value(&settings).unwrap();
+        assert_eq!(back["removeWordsIfNoResults"], "allOptional");
+        assert_eq!(back["synonyms"][0]["type"], "synonym");
+        assert!(serde_json::from_value::<Settings>(json!({"removeWordsIfNoResults": "some"})).is_err());
     }
 }

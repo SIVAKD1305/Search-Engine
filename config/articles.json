@@ -1,4 +1,7 @@
 {
   "searchableAttributes": ["title", "tags", "topic", "author", "body"],
-  "attributesForFaceting": ["topic", "tags", "author"]
+  "attributesForFaceting": ["topic", "tags", "author"],
+  "ignorePlurals": true,
+  "removeStopWords": true,
+  "removeWordsIfNoResults": "allOptional"
 }

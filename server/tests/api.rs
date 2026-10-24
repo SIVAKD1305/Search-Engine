@@ -321,3 +321,23 @@ async fn index_names_cannot_escape_the_data_directory() {
     }
     assert!(std::fs::read_dir(dir.path().join("indexes")).unwrap().next().is_none());
 }
+
+#[tokio::test]
+async fn query_understanding_over_http() {
+    let c = Client::new();
+    c.seed().await;
+    c.admin(
+        Method::PUT,
+        "/1/indexes/products/settings",
+        Some(json!({"ignorePlurals": true, "synonyms": [{"type": "synonym", "synonyms": ["earphones", "headphones"]}]})),
+    )
+    .await;
+    assert_eq!(ids(&c.search("products", json!({"query": "earphones"})).await), ["1"]);
+    assert_eq!(ids(&c.search("products", json!({"query": "kettles"})).await), ["3"]);
+    let r = c.search("products", json!({"params": "query=wireless%20mouse%20pad&removeWordsIfNoResults=lastWords"})).await;
+    assert_eq!(ids(&r), ["2"]);
+    assert_eq!(r["queryAfterRemoval"], "wireless mouse <em>pad</em>");
+    let r = c.search("products", json!({"query": "wireless kettle", "optionalWords": "wireless"})).await;
+    assert_eq!(ids(&r), ["3"]);
+    assert!(r.get("queryAfterRemoval").is_none());
+}

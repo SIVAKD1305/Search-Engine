@@ -17,10 +17,12 @@
    multi-query, batch, partial updates, settings merge, admin/search keys, CORS
 9. Persistence: per-index snapshot + checksummed write-ahead log, fsync before
    acknowledging, torn-tail recovery, compaction into a new generation
+10. Query understanding: `ignorePlurals` (English), `synonyms` (regular and
+    one-way), `removeStopWords`, `removeWordsIfNoResults` (lastWords,
+    firstWords, allOptional) with `queryAfterRemoval`, `optionalWords`
 
 ## Next
 
-10. Plurals, synonyms, stop words, optional words
 11. Replication and multi-node
 
 ## Remember for later
@@ -43,6 +45,11 @@
 - Load test: 2,000 searches with 16 parallel `curl` processes on 4 cores
   gave p50 4.6 ms, p99 27.6 ms, 315 req/s, all 200s. The client (one process
   per request) was the bottleneck; measure again with a real load generator.
+- Query understanding not yet done: multi-word synonyms ("new york" = "ny"),
+  `altCorrection` synonyms and placeholders, Algolia's separate
+  `/synonyms` API (here synonyms are a setting), plurals and stop words for
+  languages other than English (`queryLanguages`), and splitting or joining
+  words ("head phones" = "headphones").
 - Facets not yet done: `facets_stats` (min/max/avg of numeric facets),
   searching inside facet values (`searchForFacetValues`), nested attributes
   (`brand.name`), and geo filters (`aroundLatLng`, the `geo` criterion).

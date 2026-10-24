@@ -1,5 +1,14 @@
 {
   "searchableAttributes": ["name", "brand", "category", "features", "description"],
   "attributesForFaceting": ["brand", "category", "color", "in_stock", "features"],
-  "customRanking": ["desc(rating)", "desc(reviews_count)"]
+  "customRanking": ["desc(rating)", "desc(reviews_count)"],
+  "ignorePlurals": true,
+  "removeStopWords": true,
+  "removeWordsIfNoResults": "lastWords",
+  "synonyms": [
+    {"type": "synonym", "synonyms": ["headphones", "earphones", "headset"]},
+    {"type": "synonym", "synonyms": ["laptop", "notebook"]},
+    {"type": "oneWaySynonym", "input": "phone", "synonyms": ["smartphone"]},
+    {"type": "synonym", "synonyms": ["sofa", "couch"]}
+  ]
 }
