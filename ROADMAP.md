@@ -20,10 +20,14 @@
 10. Query understanding: `ignorePlurals` (English), `synonyms` (regular and
     one-way), `removeStopWords`, `removeWordsIfNoResults` (lastWords,
     firstWords, allOptional) with `queryAfterRemoval`, `optionalWords`
+11a. Read replicas (like Algolia's DSN): numbered change log with index
+    epochs, `--replica-of`, log shipping with long-poll, snapshot copy when
+    too far behind, replicas persist, refuse writes, report lag
 
 ## Next
 
-11. Replication and multi-node
+11b. Automatic failover: 3 nodes agree on every write (Raft) and elect a new
+    primary when one fails
 
 ## Remember for later
 
@@ -37,6 +41,11 @@
 - Each single-record write waits for its own fsync (about 11 ms per request in
   this container, including curl). Group commit (one fsync for writes that
   arrive together) would raise write throughput; batches already share one.
+- Replication gaps: a replica that was disconnected retries with backoff
+  up to 10 s, so catch-up after an outage can take that long; replicas use the
+  primary's admin key (a dedicated replication key would be safer); the
+  primary is a single point of failure for writes until 11b; replication
+  traffic is plain HTTP unless the primary URL is https.
 - Server gaps: applying a write holds the index's write lock, so a big batch
   pauses searches on that index while it is applied in memory (the fsync
   itself does not block searches; Algolia runs indexing in a separate

@@ -2,15 +2,22 @@
 //!
 //! Usage: server [--host 127.0.0.1] [--port 8080] [--data-dir DIR | --in-memory]
 //!               [--load NAME=records.jsonl[,settings.json]]...
+//!               [--replica-of PRIMARY_URL]
 //!
 //! Data is kept in DIR (default `./search-data`) and reloaded at startup.
 //! `--load` replaces that index with the file's records.
 //!
 //! Keys come from SEARCH_ADMIN_KEY and SEARCH_SEARCH_KEY. A missing key is
 //! generated and printed once at startup.
+//!
+//! With `--replica-of`, the server copies every index from the primary,
+//! follows its changes and refuses client writes. It authenticates with the
+//! primary's admin key from SEARCH_PRIMARY_ADMIN_KEY (default: its own
+//! admin key).
 
 use engine::index::{Index, Settings};
 use rand::RngCore;
+use server::replication::run_replica;
 use server::{AppState, app};
 use std::fs::File;
 use std::io::BufReader;
@@ -54,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut port = 8080u16;
     let mut loads = Vec::new();
     let mut data_dir = Some(PathBuf::from("search-data"));
+    let mut replica_of: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -62,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--load" => loads.push(args.next().ok_or("--load needs a value")?),
             "--data-dir" => data_dir = Some(args.next().ok_or("--data-dir needs a value")?.into()),
             "--in-memory" => data_dir = None,
+            "--replica-of" => replica_of = Some(args.next().ok_or("--replica-of needs the primary's URL")?),
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -81,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = match &data_dir {
         Some(dir) => {
             let start = Instant::now();
-            let state = AppState::open(admin_key, search_key, dir)?;
+            let state = AppState::open(admin_key.clone(), search_key, dir)?;
             let names = state.index_names();
             println!(
                 "data directory {}: {} index(es) loaded in {:.0} ms {:?}",
@@ -94,10 +103,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             println!("in-memory mode: data is lost when the server stops");
-            AppState::new(admin_key, search_key)
+            AppState::new(admin_key.clone(), search_key)
         }
     };
+    if replica_of.is_some() && !loads.is_empty() {
+        return Err("a replica copies its data from the primary; --load is not allowed".into());
+    }
+    let primary_key = std::env::var("SEARCH_PRIMARY_ADMIN_KEY").unwrap_or_else(|_| admin_key.clone());
+    let state = match &replica_of {
+        Some(url) => {
+            println!("read replica of {url}");
+            state.as_replica_of(url.as_str())
+        }
+        None => state,
+    };
     let state = Arc::new(state);
+    if replica_of.is_some() {
+        tokio::spawn(run_replica(state.clone(), primary_key));
+    }
     for spec in &loads {
         let (name, index) = load(spec)?;
         state.insert_index(&name, index)?;

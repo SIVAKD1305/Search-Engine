@@ -10,7 +10,11 @@
 //! first made durable in the index's write-ahead log (see `storage`).
 
 pub mod params;
+pub mod replication;
+pub mod state;
 pub mod storage;
+
+pub use state::AppState;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
@@ -22,13 +26,11 @@ use axum::{Json, Router};
 use engine::index::{Index, Settings};
 use engine::search::{SearchParams, search};
 use params::ResponseOptions;
-use storage::{Entry, IndexStore, StorageError};
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use state::Op;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use storage::StorageError;
 use subtle::ConstantTimeEq;
 use tower_http::cors::CorsLayer;
 
@@ -46,11 +48,11 @@ impl ApiError {
         ApiError { status: StatusCode::BAD_REQUEST, message: message.into() }
     }
 
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         ApiError { status: StatusCode::NOT_FOUND, message: message.into() }
     }
 
-    fn storage(e: StorageError) -> Self {
+    pub(crate) fn storage(e: StorageError) -> Self {
         eprintln!("{e}");
         ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: "could not save the change".into() }
     }
@@ -64,113 +66,8 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult = Result<Json<Value>, ApiError>;
-/// One index and its storage. Writers take `store` first, so writes to an
-/// index are serialized while searches keep reading `index`; the index lock
-/// is held for writing only while changes are applied in memory.
-pub struct IndexEntry {
-    index: RwLock<Index>,
-    store: Mutex<Option<IndexStore>>,
-}
 
-type SharedIndex = Arc<IndexEntry>;
-
-pub struct AppState {
-    indexes: RwLock<HashMap<String, SharedIndex>>,
-    /// `None` keeps everything in memory.
-    data_dir: Option<PathBuf>,
-    admin_key: String,
-    search_key: String,
-    next_task: AtomicU64,
-    next_object: AtomicU64,
-}
-
-impl AppState {
-    /// A server that keeps its data in memory only.
-    pub fn new(admin_key: String, search_key: String) -> Self {
-        assert!(!admin_key.is_empty() && !search_key.is_empty(), "API keys must not be empty");
-        AppState {
-            indexes: RwLock::new(HashMap::new()),
-            data_dir: None,
-            admin_key,
-            search_key,
-            next_task: AtomicU64::new(1),
-            next_object: AtomicU64::new(1),
-        }
-    }
-
-    /// A server that stores its data under `dir`, loading what is there.
-    pub fn open(admin_key: String, search_key: String, dir: &FsPath) -> Result<Self, StorageError> {
-        let mut state = AppState::new(admin_key, search_key);
-        state.data_dir = Some(dir.to_owned());
-        for (name, index, store) in storage::open_all(dir)? {
-            let entry = IndexEntry { index: RwLock::new(index), store: Mutex::new(Some(store)) };
-            state.indexes.get_mut().unwrap().insert(name, Arc::new(entry));
-        }
-        Ok(state)
-    }
-
-    pub fn index_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.indexes.read().unwrap().keys().cloned().collect();
-        names.sort();
-        names
-    }
-
-    /// Adds or replaces an index with a pre-built one (used at startup).
-    pub fn insert_index(&self, name: &str, index: Index) -> Result<(), StorageError> {
-        validate_index_name(name).map_err(|e| StorageError::Corrupt(e.message))?;
-        if let Some(old) = self.indexes.write().unwrap().remove(name)
-            && let Some(store) = old.store.lock().unwrap().take()
-        {
-            store.destroy()?;
-        }
-        let store = match &self.data_dir {
-            Some(dir) => Some(IndexStore::create(&storage::index_dir(dir, name), &index)?),
-            None => None,
-        };
-        let entry = IndexEntry { index: RwLock::new(index), store: Mutex::new(store) };
-        self.indexes.write().unwrap().insert(name.to_owned(), Arc::new(entry));
-        Ok(())
-    }
-
-    fn index(&self, name: &str) -> Result<SharedIndex, ApiError> {
-        self.indexes
-            .read()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found(format!("Index {name} does not exist")))
-    }
-
-    /// Writes create the index if needed, as in Algolia.
-    fn index_or_create(&self, name: &str) -> Result<SharedIndex, ApiError> {
-        validate_index_name(name)?;
-        let mut indexes = self.indexes.write().unwrap();
-        if let Some(entry) = indexes.get(name) {
-            return Ok(entry.clone());
-        }
-        let index = Index::new(Settings::default());
-        let store = match &self.data_dir {
-            Some(dir) => Some(IndexStore::create(&storage::index_dir(dir, name), &index).map_err(ApiError::storage)?),
-            None => None,
-        };
-        let entry = Arc::new(IndexEntry { index: RwLock::new(index), store: Mutex::new(store) });
-        indexes.insert(name.to_owned(), entry.clone());
-        Ok(entry)
-    }
-
-    fn task(&self) -> u64 {
-        self.next_task.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// An objectID for records added without one.
-    fn new_object_id(&self) -> String {
-        let n = self.next_object.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        format!("{nanos:x}{n:x}")
-    }
-}
-
-fn validate_index_name(name: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_index_name(name: &str) -> Result<(), ApiError> {
     // Names are also directory names, so "." and ".." must not be possible.
     let ok = !name.is_empty()
         && !name.starts_with('.')
@@ -259,6 +156,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/1/indexes/{index}/task/{task}", get(task_status))
         .route("/1/indexes/{index}/{object_id}", get(get_object).put(put_object).delete(delete_object))
         .route("/1/indexes/{index}/{object_id}/partial", post(partial_update))
+        .merge(replication::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), |State(s), req, next| {
             require(s, Access::Admin, req, next)
         }));
@@ -394,15 +292,6 @@ async fn multi_query(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
 
 // ---- writes ----
 
-/// A requested change, before it is resolved against the stored records.
-enum Op {
-    Put(String, Map<String, Value>),
-    Partial { id: String, changes: Map<String, Value>, create: bool },
-    Delete(String),
-    Clear,
-    Settings(Settings),
-}
-
 fn object_id_of(record: &Map<String, Value>) -> Option<String> {
     match record.get("objectID") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -411,101 +300,24 @@ fn object_id_of(record: &Map<String, Value>) -> Option<String> {
     }
 }
 
-/// Turns operations into log entries. Partial updates become full records,
-/// looking first at earlier operations of the same request.
-fn resolve(index: &Index, ops: Vec<Op>) -> Vec<Entry> {
-    let mut pending: HashMap<String, Option<Map<String, Value>>> = HashMap::new();
-    let mut cleared = false;
-    let mut entries = Vec::with_capacity(ops.len());
-    for op in ops {
-        match op {
-            Op::Put(id, mut record) => {
-                record.insert("objectID".into(), Value::String(id.clone()));
-                pending.insert(id, Some(record.clone()));
-                entries.push(Entry::Put { record });
-            }
-            Op::Partial { id, changes, create } => {
-                let current = match pending.get(&id) {
-                    Some(record) => record.clone(),
-                    None if cleared => None,
-                    None => index.get_object(&id).cloned(),
-                };
-                let mut record = match current {
-                    Some(record) => record,
-                    None if create => Map::new(),
-                    None => continue,
-                };
-                record.extend(changes);
-                record.insert("objectID".into(), Value::String(id.clone()));
-                pending.insert(id, Some(record.clone()));
-                entries.push(Entry::Put { record });
-            }
-            Op::Delete(id) => {
-                pending.insert(id.clone(), None);
-                entries.push(Entry::Delete { object_id: id });
-            }
-            Op::Clear => {
-                pending.clear();
-                cleared = true;
-                entries.push(Entry::Clear);
-            }
-            Op::Settings(settings) => entries.push(Entry::Settings { settings }),
-        }
-    }
-    entries
-}
-
-/// Logs the changes durably, then applies them in memory.
-fn commit(entry: &SharedIndex, ops: Vec<Op>) -> Result<(), ApiError> {
-    let mut store = entry.store.lock().unwrap();
-    let entries = resolve(&entry.index.read().unwrap(), ops);
-    if let Some(store) = store.as_mut() {
-        store.append(&entries).map_err(ApiError::storage)?;
-    }
-    {
-        let mut index = entry.index.write().unwrap();
-        for e in &entries {
-            e.apply(&mut index);
-        }
-    }
-    if let Some(store) = store.as_mut()
-        && store.needs_snapshot()
-    {
-        // The log still holds everything, so a failed snapshot loses nothing.
-        if let Err(e) = store.snapshot(&entry.index.read().unwrap()) {
-            eprintln!("snapshot failed: {e}");
-        }
-    }
-    Ok(())
-}
-
 // ---- indexes and settings ----
 
 async fn list_indexes(State(state): State<Arc<AppState>>) -> ApiResult {
-    let indexes = state.indexes.read().unwrap();
-    let mut items: Vec<Value> = indexes
+    let items: Vec<Value> = state
+        .indexes()
         .iter()
         .map(|(name, entry)| json!({ "name": name, "entries": entry.index.read().unwrap().stats().records }))
         .collect();
-    items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(Json(json!({ "items": items, "nbPages": 1 })))
 }
 
 async fn delete_index(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
-    let entry = state
-        .indexes
-        .write()
-        .unwrap()
-        .remove(&name)
-        .ok_or_else(|| ApiError::not_found(format!("Index {name} does not exist")))?;
-    if let Some(store) = entry.store.lock().unwrap().take() {
-        store.destroy().map_err(|e| ApiError::storage(e.into()))?;
-    }
+    state.delete_index(&name)?;
     Ok(Json(json!({ "taskID": state.task(), "deletedAt": now() })))
 }
 
 async fn clear_index(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
-    commit(&state.index(&name)?, vec![Op::Clear])?;
+    state.commit(&state.index(&name)?, vec![Op::Clear])?;
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
@@ -525,7 +337,7 @@ async fn set_settings(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     }
     let settings: Settings =
         serde_json::from_value(merged).map_err(|e| ApiError::bad_request(format!("invalid settings: {e}")))?;
-    commit(&entry, vec![Op::Settings(settings)])?;
+    state.commit(&entry, vec![Op::Settings(settings)])?;
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
@@ -539,7 +351,7 @@ async fn task_status(State(state): State<Arc<AppState>>, Path((name, _task)): Pa
 async fn add_object(State(state): State<Arc<AppState>>, Path(name): Path<String>, body: Bytes) -> ApiResult {
     let record = json_object(&body)?;
     let object_id = object_id_of(&record).unwrap_or_else(|| state.new_object_id());
-    commit(&state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)])?;
+    state.commit(&state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)])?;
     Ok(Json(json!({ "createdAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -556,7 +368,7 @@ async fn put_object(
     body: Bytes,
 ) -> ApiResult {
     let record = json_object(&body)?;
-    commit(&state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)])?;
+    state.commit(&state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)])?;
     Ok(Json(json!({ "updatedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -570,7 +382,7 @@ async fn partial_update(
     let query = params::from_query_string(q.as_deref().unwrap_or(""));
     let create = !query.get("createIfNotExists").is_some_and(|v| v == false);
     let op = Op::Partial { id: object_id.clone(), changes, create };
-    commit(&state.index_or_create(&name)?, vec![op])?;
+    state.commit(&state.index_or_create(&name)?, vec![op])?;
     Ok(Json(json!({ "updatedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -578,7 +390,7 @@ async fn delete_object(
     State(state): State<Arc<AppState>>,
     Path((name, object_id)): Path<(String, String)>,
 ) -> ApiResult {
-    commit(&state.index(&name)?, vec![Op::Delete(object_id.clone())])?;
+    state.commit(&state.index(&name)?, vec![Op::Delete(object_id.clone())])?;
     Ok(Json(json!({ "deletedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -619,7 +431,7 @@ async fn batch(State(state): State<Arc<AppState>>, Path(name): Path<String>, bod
         }
         ops.push(op);
     }
-    commit(&state.index_or_create(&name)?, ops)?;
+    state.commit(&state.index_or_create(&name)?, ops)?;
     Ok(Json(json!({ "taskID": state.task(), "objectIDs": object_ids })))
 }
 

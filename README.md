@@ -38,6 +38,22 @@ Data is saved in `./search-data` (change with `--data-dir DIR`, or use
 write-ahead log on disk before the server answers, so it survives a crash.
 `--load` replaces an index with the records of a JSONL file.
 
+## Read replicas
+
+Start more servers that copy everything from a primary and serve searches:
+
+```bash
+SEARCH_ADMIN_KEY=replica-admin SEARCH_SEARCH_KEY=my-search \
+SEARCH_PRIMARY_ADMIN_KEY=my-admin \
+  cargo run --release -p server -- --port 8081 --data-dir replica-data \
+  --replica-of http://127.0.0.1:8080
+```
+
+A replica copies each index, then follows every change (usually within a few
+milliseconds). It keeps serving searches when the primary is down and catches
+up when it returns. Writes sent to a replica are refused with `403`. Check
+lag with `GET /1/replication/status` (admin key).
+
 | Method | Path | Key |
 |---|---|---|
 | POST | `/1/indexes/{index}/query` | search |

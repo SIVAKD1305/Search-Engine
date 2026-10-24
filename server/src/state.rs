@@ -1,0 +1,455 @@
+//! Server state: the indexes, their storage, and every way they change.
+//!
+//! All changes go through one path per index: take the index's write log,
+//! give the changes the next sequence numbers, make them durable, apply them
+//! in memory, and keep them in a short in-memory history that replicas read.
+//! A primary produces changes from client requests (`commit`); a replica
+//! receives numbered changes from its primary (`apply_replicated`) or a whole
+//! index (`install_index`).
+
+use crate::ApiError;
+use crate::storage::{self, Entry, IndexStore, Logged, SnapshotData, StorageError};
+use axum::http::StatusCode;
+use engine::index::{Index, Settings};
+use serde_json::{Map, Value};
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
+
+/// Changes kept in memory per index for replicas that are catching up.
+/// A replica further behind downloads a snapshot instead.
+pub const DEFAULT_RECENT_LIMIT: usize = 100_000;
+
+/// The index's position in its history.
+pub struct WriteLog {
+    store: Option<IndexStore>,
+    seq: u64,
+    epoch: u64,
+    recent: VecDeque<Logged>,
+}
+
+/// One index. Writers take `log` first, so writes to an index are
+/// serialized while searches keep reading `index`; the index lock is held
+/// for writing only while changes are applied in memory.
+pub struct IndexEntry {
+    pub index: RwLock<Index>,
+    log: Mutex<WriteLog>,
+}
+
+pub type SharedIndex = Arc<IndexEntry>;
+
+impl IndexEntry {
+    fn new(index: Index, store: Option<IndexStore>, seq: u64, epoch: u64, recent: Vec<Logged>) -> SharedIndex {
+        let log = WriteLog { store, seq, epoch, recent: recent.into() };
+        Arc::new(IndexEntry { index: RwLock::new(index), log: Mutex::new(log) })
+    }
+
+    /// (sequence number, epoch)
+    pub fn position(&self) -> (u64, u64) {
+        let log = self.log.lock().unwrap();
+        (log.seq, log.epoch)
+    }
+}
+
+/// A requested change, before it is resolved against the stored records.
+pub enum Op {
+    Put(String, Map<String, Value>),
+    Partial { id: String, changes: Map<String, Value>, create: bool },
+    Delete(String),
+    Clear,
+    Settings(Settings),
+}
+
+/// Turns operations into log entries. Partial updates become full records,
+/// looking first at earlier operations of the same request.
+fn resolve(index: &Index, ops: Vec<Op>) -> Vec<Entry> {
+    let mut pending: HashMap<String, Option<Map<String, Value>>> = HashMap::new();
+    let mut cleared = false;
+    let mut entries = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            Op::Put(id, mut record) => {
+                record.insert("objectID".into(), Value::String(id.clone()));
+                pending.insert(id, Some(record.clone()));
+                entries.push(Entry::Put { record });
+            }
+            Op::Partial { id, changes, create } => {
+                let current = match pending.get(&id) {
+                    Some(record) => record.clone(),
+                    None if cleared => None,
+                    None => index.get_object(&id).cloned(),
+                };
+                let mut record = match current {
+                    Some(record) => record,
+                    None if create => Map::new(),
+                    None => continue,
+                };
+                record.extend(changes);
+                record.insert("objectID".into(), Value::String(id.clone()));
+                pending.insert(id, Some(record.clone()));
+                entries.push(Entry::Put { record });
+            }
+            Op::Delete(id) => {
+                pending.insert(id.clone(), None);
+                entries.push(Entry::Delete { object_id: id });
+            }
+            Op::Clear => {
+                pending.clear();
+                cleared = true;
+                entries.push(Entry::Clear);
+            }
+            Op::Settings(settings) => entries.push(Entry::Settings { settings }),
+        }
+    }
+    entries
+}
+
+/// Why changes from the primary could not be applied.
+#[derive(Debug)]
+pub enum ReplicationError {
+    /// The local copy no longer follows the primary's history: download the
+    /// whole index again.
+    Diverged(String),
+    Storage(StorageError),
+}
+
+impl std::fmt::Display for ReplicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplicationError::Diverged(msg) => write!(f, "replica diverged: {msg}"),
+            ReplicationError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// A slice of an index's history, for a replica.
+pub struct LogSlice {
+    pub epoch: u64,
+    /// The primary's latest sequence number.
+    pub seq: u64,
+    pub entries: Vec<Logged>,
+}
+
+/// What a replica knows about its primary.
+#[derive(Debug, Default, Clone)]
+pub struct ReplicaStatus {
+    pub last_contact: Option<Instant>,
+    pub last_error: Option<String>,
+    /// Latest sequence number seen on the primary, per index.
+    pub primary_seq: HashMap<String, u64>,
+}
+
+pub struct AppState {
+    indexes: RwLock<HashMap<String, SharedIndex>>,
+    /// Held while an index is created, replaced or deleted, including the
+    /// disk work, so that deleting `x` and creating a new `x` at the same
+    /// time cannot remove the new index's files.
+    lifecycle: Mutex<()>,
+    /// `None` keeps everything in memory.
+    data_dir: Option<PathBuf>,
+    pub(crate) admin_key: String,
+    pub(crate) search_key: String,
+    next_task: AtomicU64,
+    next_object: AtomicU64,
+    /// Counts every change on any index; replicas wait for it to move.
+    changes: watch::Sender<u64>,
+    /// Set on a read replica: the primary's URL.
+    primary: Option<String>,
+    recent_limit: usize,
+    pub(crate) replica_status: Mutex<ReplicaStatus>,
+}
+
+impl AppState {
+    /// A server that keeps its data in memory only.
+    pub fn new(admin_key: String, search_key: String) -> Self {
+        assert!(!admin_key.is_empty() && !search_key.is_empty(), "API keys must not be empty");
+        AppState {
+            indexes: RwLock::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+            data_dir: None,
+            admin_key,
+            search_key,
+            next_task: AtomicU64::new(1),
+            next_object: AtomicU64::new(1),
+            changes: watch::channel(0).0,
+            primary: None,
+            recent_limit: DEFAULT_RECENT_LIMIT,
+            replica_status: Mutex::new(ReplicaStatus::default()),
+        }
+    }
+
+    /// A server that stores its data under `dir`, loading what is there.
+    pub fn open(admin_key: String, search_key: String, dir: &Path) -> Result<Self, StorageError> {
+        let mut state = AppState::new(admin_key, search_key);
+        state.data_dir = Some(dir.to_owned());
+        for (name, loaded) in storage::open_all(dir)? {
+            let entry = IndexEntry::new(loaded.index, Some(loaded.store), loaded.seq, loaded.epoch, loaded.recent);
+            state.indexes.get_mut().unwrap().insert(name, entry);
+        }
+        Ok(state)
+    }
+
+    /// Makes this server a read replica of `primary_url`.
+    pub fn as_replica_of(mut self, primary_url: impl Into<String>) -> Self {
+        self.primary = Some(primary_url.into().trim_end_matches('/').to_owned());
+        self
+    }
+
+    /// How many recent changes to keep per index for replicas.
+    pub fn with_recent_limit(mut self, limit: usize) -> Self {
+        self.recent_limit = limit.max(1);
+        self
+    }
+
+    pub fn primary(&self) -> Option<&str> {
+        self.primary.as_deref()
+    }
+
+    pub fn index_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.indexes.read().unwrap().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    pub fn indexes(&self) -> Vec<(String, SharedIndex)> {
+        let mut all: Vec<_> = self.indexes.read().unwrap().iter().map(|(n, e)| (n.clone(), e.clone())).collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
+    pub fn index(&self, name: &str) -> Result<SharedIndex, ApiError> {
+        self.indexes
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found(format!("Index {name} does not exist")))
+    }
+
+    /// Replicas only accept changes from their primary.
+    fn ensure_writable(&self) -> Result<(), ApiError> {
+        match &self.primary {
+            None => Ok(()),
+            Some(primary) => Err(ApiError {
+                status: StatusCode::FORBIDDEN,
+                message: format!("this server is a read replica; send writes to {primary}"),
+            }),
+        }
+    }
+
+    fn new_store(&self, name: &str, index: &Index, seq: u64, epoch: u64) -> Result<Option<IndexStore>, StorageError> {
+        match &self.data_dir {
+            Some(dir) => Ok(Some(IndexStore::create(&storage::index_dir(dir, name), index, seq, epoch)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes create the index if needed, as in Algolia.
+    pub fn index_or_create(&self, name: &str) -> Result<SharedIndex, ApiError> {
+        self.ensure_writable()?;
+        crate::validate_index_name(name)?;
+        if let Some(entry) = self.indexes.read().unwrap().get(name) {
+            return Ok(entry.clone());
+        }
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        let mut indexes = self.indexes.write().unwrap();
+        if let Some(entry) = indexes.get(name) {
+            return Ok(entry.clone());
+        }
+        let index = Index::new(Settings::default());
+        let epoch = storage::new_epoch();
+        let store = self.new_store(name, &index, 0, epoch).map_err(ApiError::storage)?;
+        let entry = IndexEntry::new(index, store, 0, epoch, Vec::new());
+        indexes.insert(name.to_owned(), entry.clone());
+        drop(indexes);
+        self.changed();
+        Ok(entry)
+    }
+
+    /// Adds or replaces an index with a pre-built one (used at startup).
+    pub fn insert_index(&self, name: &str, index: Index) -> Result<(), StorageError> {
+        crate::validate_index_name(name).map_err(|e| StorageError::Corrupt(e.message))?;
+        self.install(name, SnapshotData { index, seq: 0, epoch: Some(storage::new_epoch()) })
+    }
+
+    /// Replaces an index with a copy received from the primary.
+    pub fn install_index(&self, name: &str, data: SnapshotData) -> Result<(), StorageError> {
+        crate::validate_index_name(name).map_err(|e| StorageError::Corrupt(e.message))?;
+        self.install(name, data)
+    }
+
+    fn install(&self, name: &str, data: SnapshotData) -> Result<(), StorageError> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        let epoch = data.epoch.unwrap_or_else(storage::new_epoch);
+        if let Some(old) = self.indexes.write().unwrap().remove(name)
+            && let Some(store) = old.log.lock().unwrap().store.take()
+        {
+            store.destroy()?;
+        }
+        let store = self.new_store(name, &data.index, data.seq, epoch)?;
+        let entry = IndexEntry::new(data.index, store, data.seq, epoch, Vec::new());
+        self.indexes.write().unwrap().insert(name.to_owned(), entry);
+        self.changed();
+        Ok(())
+    }
+
+    /// Deletes an index and its files.
+    pub fn delete_index(&self, name: &str) -> Result<(), ApiError> {
+        self.ensure_writable()?;
+        self.remove_index(name).map_err(|e| ApiError::storage(e.into()))?.then_some(()).ok_or_else(|| {
+            ApiError::not_found(format!("Index {name} does not exist"))
+        })
+    }
+
+    /// Removes an index; returns false if it did not exist.
+    pub fn remove_index(&self, name: &str) -> std::io::Result<bool> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        let Some(entry) = self.indexes.write().unwrap().remove(name) else { return Ok(false) };
+        if let Some(store) = entry.log.lock().unwrap().store.take() {
+            store.destroy()?;
+        }
+        self.changed();
+        Ok(true)
+    }
+
+    /// Applies client changes: numbers them, makes them durable, applies them.
+    pub fn commit(&self, entry: &SharedIndex, ops: Vec<Op>) -> Result<(), ApiError> {
+        self.ensure_writable()?;
+        let mut log = entry.log.lock().unwrap();
+        let entries = resolve(&entry.index.read().unwrap(), ops);
+        let first = log.seq + 1;
+        let logged: Vec<Logged> =
+            entries.into_iter().enumerate().map(|(i, entry)| Logged { seq: first + i as u64, entry }).collect();
+        self.write(entry, &mut log, logged).map_err(ApiError::storage)
+    }
+
+    /// Applies numbered changes from the primary. Changes already applied
+    /// are skipped, so fetching the same range twice is harmless.
+    pub fn apply_replicated(&self, name: &str, epoch: u64, logged: Vec<Logged>) -> Result<(), ReplicationError> {
+        let entry = self.index(name).map_err(|e| ReplicationError::Diverged(e.message))?;
+        let mut log = entry.log.lock().unwrap();
+        if log.epoch != epoch {
+            return Err(ReplicationError::Diverged(format!("{name}: epoch changed")));
+        }
+        let fresh: Vec<Logged> = logged.into_iter().filter(|l| l.seq > log.seq).collect();
+        if let Some(first) = fresh.first()
+            && first.seq != log.seq + 1
+        {
+            return Err(ReplicationError::Diverged(format!("{name}: expected {}, got {}", log.seq + 1, first.seq)));
+        }
+        if fresh.windows(2).any(|w| w[1].seq != w[0].seq + 1) {
+            return Err(ReplicationError::Diverged(format!("{name}: gap in received changes")));
+        }
+        self.write(&entry, &mut log, fresh).map_err(ReplicationError::Storage)
+    }
+
+    fn write(&self, entry: &IndexEntry, log: &mut WriteLog, logged: Vec<Logged>) -> Result<(), StorageError> {
+        let Some(last) = logged.last().map(|l| l.seq) else { return Ok(()) };
+        if let Some(store) = log.store.as_mut() {
+            store.append(&logged)?;
+        }
+        {
+            let mut index = entry.index.write().unwrap();
+            for l in &logged {
+                l.entry.apply(&mut index);
+            }
+        }
+        log.seq = last;
+        log.recent.extend(logged);
+        while log.recent.len() > self.recent_limit {
+            log.recent.pop_front();
+        }
+        let (seq, epoch) = (log.seq, log.epoch);
+        if let Some(store) = log.store.as_mut()
+            && store.needs_snapshot()
+        {
+            // The log still holds everything, so a failed snapshot loses nothing.
+            if let Err(e) = store.snapshot(&entry.index.read().unwrap(), seq, epoch) {
+                eprintln!("snapshot failed: {e}");
+            }
+        }
+        self.changed();
+        Ok(())
+    }
+
+    /// Changes with sequence numbers from `from`, at most `limit` of them.
+    /// `None` when they are no longer kept in memory.
+    pub fn log_since(&self, name: &str, from: u64, limit: usize) -> Result<Option<LogSlice>, ApiError> {
+        let entry = self.index(name)?;
+        let log = entry.log.lock().unwrap();
+        let first_kept = log.recent.front().map_or(log.seq + 1, |l| l.seq);
+        if from < first_kept && from <= log.seq {
+            return Ok(None);
+        }
+        let entries = log.recent.iter().filter(|l| l.seq >= from).take(limit).cloned().collect();
+        Ok(Some(LogSlice { epoch: log.epoch, seq: log.seq, entries }))
+    }
+
+    /// The whole index as snapshot bytes, consistent with one sequence number.
+    pub fn snapshot_bytes(&self, name: &str) -> Result<Vec<u8>, ApiError> {
+        let entry = self.index(name)?;
+        let log = entry.log.lock().unwrap();
+        let index = entry.index.read().unwrap();
+        let mut bytes = Vec::new();
+        storage::write_snapshot_to(&mut bytes, &index, log.seq, log.epoch).expect("writing to memory");
+        Ok(bytes)
+    }
+
+    fn changed(&self) {
+        self.changes.send_modify(|v| *v += 1);
+    }
+
+    /// The change counter, and a way to wait for it to move.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    pub fn task(&self) -> u64 {
+        self.next_task.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// An objectID for records added without one.
+    pub fn new_object_id(&self) -> String {
+        let n = self.next_object.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        format!("{nanos:x}{n:x}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Barrier;
+
+    #[test]
+    fn deleting_and_recreating_at_once_keeps_the_new_index_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::open("a".into(), "s".into(), dir.path()).unwrap());
+        for round in 0..200 {
+            let entry = state.index_or_create("race").unwrap();
+            state.commit(&entry, vec![Op::Put("old".into(), Map::new())]).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let deleter = {
+                let (state, barrier) = (state.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.remove_index("race").unwrap();
+                })
+            };
+            barrier.wait();
+            let created = state.index_or_create("race").unwrap();
+            let record = json!({"v": round}).as_object().unwrap().clone();
+            state.commit(&created, vec![Op::Put("new".into(), record)]).unwrap();
+            deleter.join().unwrap();
+            // An index that is live in memory must still have its files.
+            if state.index("race").is_ok() {
+                assert!(dir.path().join("indexes/race").exists(), "round {round}: files of a live index were deleted");
+            }
+        }
+    }
+}
+

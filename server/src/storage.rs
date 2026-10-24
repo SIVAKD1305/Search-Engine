@@ -2,10 +2,16 @@
 //!
 //! An index directory holds one generation `N`:
 //!
-//! - `snapshot-N.jsonl`: a header line `{"version":1,"settings":{...}}`, one
-//!   record per line, and a trailer `{"end":<record count>}`.
-//! - `wal-N.log`: every change since that snapshot, one per line, as
-//!   `<crc32 in hex> <json>`.
+//! - `snapshot-N.jsonl`: a header line
+//!   `{"version":2,"settings":{...},"seq":S,"epoch":E}`, one record per line,
+//!   and a trailer `{"end":<record count>}`.
+//! - `wal-N.log`: every change after sequence number `S`, one per line, as
+//!   `<crc32 in hex> {"seq":S+1,"entry":{...}}`.
+//!
+//! Every change has a sequence number (1, 2, 3, ... per index); replicas use
+//! it to know what they are missing. The epoch is a random id given to an
+//! index when it is created, so a replica can tell a re-created index from
+//! the old one.
 //!
 //! A write is acknowledged only after its log lines are fsynced. On startup
 //! the snapshot is loaded and its log replayed. A damaged *last* log line is
@@ -15,6 +21,9 @@
 //! When the log grows past a limit, the next generation's snapshot is
 //! written to a temporary file and renamed into place (an atomic step), an
 //! empty log is started, and the old generation is deleted.
+//!
+//! Version 1 files (step 9, without sequence numbers) are still read; their
+//! entries are numbered from 1 and the index gets a new epoch.
 
 use engine::index::{Index, Settings};
 use serde::{Deserialize, Serialize};
@@ -26,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 pub const SNAPSHOT_AFTER_ENTRIES: u64 = 10_000;
 pub const SNAPSHOT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
-const FORMAT_VERSION: u64 = 1;
+const FORMAT_VERSION: u64 = 2;
 
 /// One logged change. Partial updates are logged as the full resulting
 /// record, so replaying the log never depends on anything but the log.
@@ -57,6 +66,13 @@ impl Entry {
     }
 }
 
+/// An entry with its sequence number.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Logged {
+    pub seq: u64,
+    pub entry: Entry,
+}
+
 #[derive(Debug)]
 pub enum StorageError {
     Io(io::Error),
@@ -84,6 +100,11 @@ fn corrupt(path: &Path, msg: impl fmt::Display) -> StorageError {
     StorageError::Corrupt(format!("{}: {msg}", path.display()))
 }
 
+/// A new random epoch.
+pub fn new_epoch() -> u64 {
+    rand::random::<u64>() | 1
+}
+
 fn snapshot_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("snapshot-{generation}.jsonl"))
 }
@@ -101,22 +122,27 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn write_snapshot(dir: &Path, generation: u64, index: &Index) -> Result<(), StorageError> {
-    let path = snapshot_path(dir, generation);
-    let tmp = path.with_extension("jsonl.tmp");
-    let file = File::create(&tmp)?;
-    let mut out = BufWriter::new(file);
-    let header = json!({ "version": FORMAT_VERSION, "settings": index.settings() });
-    serde_json::to_writer(&mut out, &header).map_err(io::Error::from)?;
+/// Writes a snapshot of `index` at sequence `seq`. Also used to send an
+/// index to a replica.
+pub fn write_snapshot_to(out: &mut impl Write, index: &Index, seq: u64, epoch: u64) -> io::Result<()> {
+    let header = json!({ "version": FORMAT_VERSION, "settings": index.settings(), "seq": seq, "epoch": epoch });
+    serde_json::to_writer(&mut *out, &header)?;
     out.write_all(b"\n")?;
     let mut count = 0u64;
     for (_, record) in index.store().iter() {
-        serde_json::to_writer(&mut out, record).map_err(io::Error::from)?;
+        serde_json::to_writer(&mut *out, record)?;
         out.write_all(b"\n")?;
         count += 1;
     }
-    serde_json::to_writer(&mut out, &json!({ "end": count })).map_err(io::Error::from)?;
-    out.write_all(b"\n")?;
+    serde_json::to_writer(&mut *out, &json!({ "end": count }))?;
+    out.write_all(b"\n")
+}
+
+fn write_snapshot(dir: &Path, generation: u64, index: &Index, seq: u64, epoch: u64) -> Result<(), StorageError> {
+    let path = snapshot_path(dir, generation);
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut out = BufWriter::new(File::create(&tmp)?);
+    write_snapshot_to(&mut out, index, seq, epoch)?;
     let file = out.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     fs::rename(&tmp, &path)?;
@@ -124,52 +150,81 @@ fn write_snapshot(dir: &Path, generation: u64, index: &Index) -> Result<(), Stor
     Ok(())
 }
 
-fn read_snapshot(path: &Path) -> Result<Index, StorageError> {
-    let mut lines = BufReader::new(File::open(path)?).lines();
+/// A snapshot read back: the index, its sequence number, and its epoch
+/// (`None` for version 1 files).
+pub struct SnapshotData {
+    pub index: Index,
+    pub seq: u64,
+    pub epoch: Option<u64>,
+}
+
+/// Reads a snapshot written by `write_snapshot_to`. `source` names it in errors.
+pub fn read_snapshot_from(reader: impl BufRead, source: &Path) -> Result<SnapshotData, StorageError> {
+    let mut lines = reader.lines();
     let header: Value = match lines.next() {
-        Some(line) => serde_json::from_str(&line?).map_err(|e| corrupt(path, format!("bad header: {e}")))?,
-        None => return Err(corrupt(path, "empty snapshot")),
+        Some(line) => serde_json::from_str(&line?).map_err(|e| corrupt(source, format!("bad header: {e}")))?,
+        None => return Err(corrupt(source, "empty snapshot")),
     };
-    if header["version"].as_u64() != Some(FORMAT_VERSION) {
-        return Err(corrupt(path, format!("unsupported version {}", header["version"])));
-    }
+    let (seq, epoch) = match header["version"].as_u64() {
+        Some(1) => (0, None),
+        Some(2) => {
+            let seq = header["seq"].as_u64().ok_or_else(|| corrupt(source, "header has no seq"))?;
+            let epoch = header["epoch"].as_u64().ok_or_else(|| corrupt(source, "header has no epoch"))?;
+            (seq, Some(epoch))
+        }
+        _ => return Err(corrupt(source, format!("unsupported version {}", header["version"]))),
+    };
     let settings: Settings = serde_json::from_value(header["settings"].clone())
-        .map_err(|e| corrupt(path, format!("bad settings: {e}")))?;
+        .map_err(|e| corrupt(source, format!("bad settings: {e}")))?;
     let mut index = Index::new(settings);
     let mut count = 0u64;
     for (n, line) in lines.enumerate() {
         let line_no = n + 2;
         let value: Value =
-            serde_json::from_str(&line?).map_err(|e| corrupt(path, format!("line {line_no}: {e}")))?;
+            serde_json::from_str(&line?).map_err(|e| corrupt(source, format!("line {line_no}: {e}")))?;
         if value.get("objectID").is_some() {
-            index.add(value).map_err(|e| corrupt(path, format!("line {line_no}: {e}")))?;
+            index.add(value).map_err(|e| corrupt(source, format!("line {line_no}: {e}")))?;
             count += 1;
         } else if value["end"].as_u64() == Some(count) {
-            return Ok(index);
+            return Ok(SnapshotData { index, seq, epoch });
         } else {
-            return Err(corrupt(path, format!("line {line_no}: bad trailer {value}")));
+            return Err(corrupt(source, format!("line {line_no}: bad trailer {value}")));
         }
     }
-    Err(corrupt(path, "missing trailer (incomplete snapshot)"))
+    Err(corrupt(source, "missing trailer (incomplete snapshot)"))
 }
 
-fn encode(entry: &Entry) -> String {
-    let body = serde_json::to_string(entry).expect("entries serialize");
+fn encode(logged: &Logged) -> String {
+    let body = serde_json::to_string(logged).expect("entries serialize");
     format!("{:08x} {body}\n", crc32fast::hash(body.as_bytes()))
 }
 
-fn decode(line: &[u8]) -> Option<Entry> {
+/// A log line's entry and, for version 2 lines, its sequence number.
+fn decode(line: &[u8]) -> Option<(Option<u64>, Entry)> {
     let line = std::str::from_utf8(line).ok()?;
     let (crc, body) = line.split_once(' ')?;
     let crc = u32::from_str_radix(crc, 16).ok()?;
-    (crc32fast::hash(body.as_bytes()) == crc).then(|| serde_json::from_str(body).ok())?
+    if crc32fast::hash(body.as_bytes()) != crc {
+        return None;
+    }
+    if let Ok(logged) = serde_json::from_str::<Logged>(body) {
+        return Some((Some(logged.seq), logged.entry));
+    }
+    serde_json::from_str::<Entry>(body).ok().map(|entry| (None, entry))
 }
 
-/// Applies the log to `index`. Returns (entries, bytes) kept.
-fn replay_wal(path: &Path, index: &mut Index) -> Result<(u64, u64), StorageError> {
+/// What replaying a log found.
+struct Replayed {
+    seq: u64,
+    entries: Vec<Logged>,
+    bytes: u64,
+}
+
+/// Applies the log to `index`, continuing from sequence number `seq`.
+fn replay_wal(path: &Path, index: &mut Index, mut seq: u64) -> Result<Replayed, StorageError> {
     let data = fs::read(path)?;
     let mut offset = 0usize;
-    let mut entries = 0u64;
+    let mut entries = Vec::new();
     let mut line_no = 0usize;
     while offset < data.len() {
         line_no += 1;
@@ -181,21 +236,26 @@ fn replay_wal(path: &Path, index: &mut Index) -> Result<(u64, u64), StorageError
         let next = offset + line.len() + usize::from(complete);
         let is_last = next >= data.len();
         match decode(line).filter(|_| complete) {
-            Some(entry) => {
+            Some((logged_seq, entry)) => {
+                let expected = seq + 1;
+                if logged_seq.is_some_and(|s| s != expected) {
+                    return Err(corrupt(path, format!("line {line_no}: seq {logged_seq:?}, expected {expected}")));
+                }
                 entry.apply(index);
-                entries += 1;
+                seq = expected;
+                entries.push(Logged { seq, entry });
                 offset = next;
             }
             None if is_last => {
                 // A crash during the last write: drop the partial line.
                 eprintln!("{}: dropping incomplete last entry (line {line_no})", path.display());
                 OpenOptions::new().write(true).open(path)?.set_len(offset as u64)?;
-                return Ok((entries, offset as u64));
+                break;
             }
             None => return Err(corrupt(path, format!("line {line_no} is damaged"))),
         }
     }
-    Ok((entries, offset as u64))
+    Ok(Replayed { seq, entries, bytes: offset as u64 })
 }
 
 fn open_wal(path: &Path) -> io::Result<File> {
@@ -210,21 +270,36 @@ pub struct IndexStore {
     wal_bytes: u64,
 }
 
+/// An index loaded from disk.
+pub struct Loaded {
+    pub index: Index,
+    pub store: IndexStore,
+    /// Sequence number of the last applied change.
+    pub seq: u64,
+    pub epoch: u64,
+    /// The changes replayed from the log (those after the snapshot).
+    pub recent: Vec<Logged>,
+}
+
 impl IndexStore {
-    /// Creates storage for a new index, starting from its current contents.
-    pub fn create(dir: &Path, index: &Index) -> Result<Self, StorageError> {
+    /// Creates storage for an index, starting from its current contents,
+    /// which reflect every change up to `seq`. Replaces anything in `dir`.
+    pub fn create(dir: &Path, index: &Index, seq: u64, epoch: u64) -> Result<Self, StorageError> {
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
         fs::create_dir_all(dir)?;
         if let Some(parent) = dir.parent() {
             sync_dir(parent)?;
         }
-        write_snapshot(dir, 1, index)?;
+        write_snapshot(dir, 1, index, seq, epoch)?;
         let wal = open_wal(&wal_path(dir, 1))?;
         sync_dir(dir)?;
         Ok(IndexStore { dir: dir.to_owned(), generation: 1, wal, wal_entries: 0, wal_bytes: 0 })
     }
 
     /// Loads an index from its directory.
-    pub fn open(dir: &Path) -> Result<(Index, Self), StorageError> {
+    pub fn open(dir: &Path) -> Result<Loaded, StorageError> {
         let mut generations = Vec::new();
         for entry in fs::read_dir(dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
@@ -236,9 +311,11 @@ impl IndexStore {
             }
         }
         let generation = *generations.iter().max().ok_or_else(|| corrupt(dir, "no snapshot"))?;
-        let mut index = read_snapshot(&snapshot_path(dir, generation))?;
+        let path = snapshot_path(dir, generation);
+        let SnapshotData { mut index, seq, epoch } = read_snapshot_from(BufReader::new(File::open(&path)?), &path)?;
         let wal = wal_path(dir, generation);
-        let (wal_entries, wal_bytes) = if wal.exists() { replay_wal(&wal, &mut index)? } else { (0, 0) };
+        let replayed =
+            if wal.exists() { replay_wal(&wal, &mut index, seq)? } else { Replayed { seq, entries: Vec::new(), bytes: 0 } };
         let file = open_wal(&wal)?;
         // Older generations are fully contained in this one.
         for old in generations.into_iter().filter(|&g| g < generation) {
@@ -246,11 +323,27 @@ impl IndexStore {
             let _ = fs::remove_file(wal_path(dir, old));
         }
         sync_dir(dir)?;
-        Ok((index, IndexStore { dir: dir.to_owned(), generation, wal: file, wal_entries, wal_bytes }))
+        let mut store = IndexStore {
+            dir: dir.to_owned(),
+            generation,
+            wal: file,
+            wal_entries: replayed.entries.len() as u64,
+            wal_bytes: replayed.bytes,
+        };
+        let epoch = match epoch {
+            Some(epoch) => epoch,
+            None => {
+                // A version 1 index: give it an epoch and rewrite it as version 2.
+                let epoch = new_epoch();
+                store.snapshot(&index, replayed.seq, epoch)?;
+                epoch
+            }
+        };
+        Ok(Loaded { index, store, seq: replayed.seq, epoch, recent: replayed.entries })
     }
 
     /// Appends entries and waits until they are on disk.
-    pub fn append(&mut self, entries: &[Entry]) -> Result<(), StorageError> {
+    pub fn append(&mut self, entries: &[Logged]) -> Result<(), StorageError> {
         let text: String = entries.iter().map(encode).collect();
         self.wal.write_all(text.as_bytes())?;
         self.wal.sync_data()?;
@@ -263,10 +356,11 @@ impl IndexStore {
         self.wal_entries >= SNAPSHOT_AFTER_ENTRIES || self.wal_bytes >= SNAPSHOT_AFTER_BYTES
     }
 
-    /// Writes `index` as the next generation and drops the old log.
-    pub fn snapshot(&mut self, index: &Index) -> Result<(), StorageError> {
+    /// Writes `index` (at sequence `seq`) as the next generation and drops
+    /// the old log.
+    pub fn snapshot(&mut self, index: &Index, seq: u64, epoch: u64) -> Result<(), StorageError> {
         let next = self.generation + 1;
-        write_snapshot(&self.dir, next, index)?;
+        write_snapshot(&self.dir, next, index, seq, epoch)?;
         let wal = open_wal(&wal_path(&self.dir, next))?;
         sync_dir(&self.dir)?;
         let old = std::mem::replace(&mut self.wal, wal);
@@ -301,7 +395,7 @@ pub fn index_dir(root: &Path, name: &str) -> PathBuf {
 }
 
 /// Opens every index stored under `root`.
-pub fn open_all(root: &Path) -> Result<Vec<(String, Index, IndexStore)>, StorageError> {
+pub fn open_all(root: &Path) -> Result<Vec<(String, Loaded)>, StorageError> {
     let indexes = root.join("indexes");
     fs::create_dir_all(&indexes)?;
     let mut opened = Vec::new();
@@ -311,8 +405,7 @@ pub fn open_all(root: &Path) -> Result<Vec<(String, Index, IndexStore)>, Storage
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let (index, store) = IndexStore::open(&entry.path())?;
-        opened.push((name, index, store));
+        opened.push((name, IndexStore::open(&entry.path())?));
     }
     opened.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(opened)
@@ -331,12 +424,16 @@ mod tests {
         index.store().iter().map(|(_, r)| r["name"].as_str().unwrap_or("").to_owned()).collect()
     }
 
-    /// Applies entries to memory and disk, as the server does.
-    fn write(index: &mut Index, store: &mut IndexStore, entries: &[Entry]) {
-        store.append(entries).unwrap();
-        for e in entries {
-            e.apply(index);
+    /// Numbers entries after `seq`, writes them to disk and memory, as the
+    /// server does. Returns the new sequence number.
+    fn write(index: &mut Index, store: &mut IndexStore, seq: u64, entries: Vec<Entry>) -> u64 {
+        let logged: Vec<Logged> =
+            entries.into_iter().enumerate().map(|(i, entry)| Logged { seq: seq + 1 + i as u64, entry }).collect();
+        store.append(&logged).unwrap();
+        for l in &logged {
+            l.entry.apply(index);
         }
+        logged.last().map_or(seq, |l| l.seq)
     }
 
     fn settings() -> Settings {
@@ -344,72 +441,77 @@ mod tests {
     }
 
     #[test]
-    fn changes_survive_reopening() {
+    fn changes_survive_reopening_with_their_sequence_numbers() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::new(settings());
-        let mut store = IndexStore::create(dir.path(), &index).unwrap();
-        write(&mut index, &mut store, &[
+        let mut store = IndexStore::create(dir.path(), &index, 0, 77).unwrap();
+        let seq = write(&mut index, &mut store, 0, vec![
             put(json!({"objectID": "1", "name": "Kettle"})),
             put(json!({"objectID": "2", "name": "Toaster"})),
             Entry::Delete { object_id: "1".into() },
             put(json!({"objectID": "3", "name": "Teapot"})),
         ]);
+        assert_eq!(seq, 4);
         drop(store);
 
-        let (reopened, store) = IndexStore::open(dir.path()).unwrap();
-        assert_eq!(names(&reopened), ["Toaster", "Teapot"]);
-        assert_eq!(reopened.settings().custom_ranking.len(), 1);
-        assert_eq!((store.wal_entries, store.generation()), (4, 1));
+        let loaded = IndexStore::open(dir.path()).unwrap();
+        assert_eq!(names(&loaded.index), ["Toaster", "Teapot"]);
+        assert_eq!(loaded.index.settings().custom_ranking.len(), 1);
+        assert_eq!((loaded.seq, loaded.epoch), (4, 77));
+        assert_eq!((loaded.store.wal_entries, loaded.store.generation()), (4, 1));
+        assert_eq!(loaded.recent.iter().map(|l| l.seq).collect::<Vec<_>>(), [1, 2, 3, 4]);
     }
 
     #[test]
     fn settings_and_clear_are_replayed() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::new(Settings::default());
-        let mut store = IndexStore::create(dir.path(), &index).unwrap();
-        write(&mut index, &mut store, &[
+        let mut store = IndexStore::create(dir.path(), &index, 0, 1).unwrap();
+        write(&mut index, &mut store, 0, vec![
             put(json!({"objectID": "1", "name": "Kettle", "brand": "Orbix"})),
             Entry::Clear,
             put(json!({"objectID": "2", "name": "Lamp", "brand": "Orbix"})),
             Entry::Settings { settings: settings() },
         ]);
         drop(store);
-        let (reopened, _) = IndexStore::open(dir.path()).unwrap();
-        assert_eq!(names(&reopened), ["Lamp"]);
+        let loaded = IndexStore::open(dir.path()).unwrap();
+        assert_eq!(names(&loaded.index), ["Lamp"]);
         // "brand" is no longer searchable after the settings change.
-        assert!(reopened.word("orbix").is_none());
-        assert!(reopened.word("lamp").is_some());
+        assert!(loaded.index.word("orbix").is_none());
+        assert!(loaded.index.word("lamp").is_some());
     }
 
     #[test]
     fn torn_last_entry_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::new(Settings::default());
-        let mut store = IndexStore::create(dir.path(), &index).unwrap();
-        write(&mut index, &mut store, &[put(json!({"objectID": "1", "name": "Kettle"}))]);
+        let mut store = IndexStore::create(dir.path(), &index, 0, 1).unwrap();
+        write(&mut index, &mut store, 0, vec![put(json!({"objectID": "1", "name": "Kettle"}))]);
         drop(store);
         // Simulate a crash half-way through writing the next entry.
         let wal = wal_path(dir.path(), 1);
         let good_len = fs::metadata(&wal).unwrap().len();
-        let half = &encode(&put(json!({"objectID": "2", "name": "Lamp"})))[..20];
+        let half = &encode(&Logged { seq: 2, entry: put(json!({"objectID": "2", "name": "Lamp"})) })[..20];
         OpenOptions::new().append(true).open(&wal).unwrap().write_all(half.as_bytes()).unwrap();
 
-        let (reopened, mut store) = IndexStore::open(dir.path()).unwrap();
-        assert_eq!(names(&reopened), ["Kettle"]);
+        let mut loaded = IndexStore::open(dir.path()).unwrap();
+        assert_eq!(names(&loaded.index), ["Kettle"]);
+        assert_eq!(loaded.seq, 1);
         assert_eq!(fs::metadata(&wal).unwrap().len(), good_len);
         // Writing continues cleanly after the cut.
-        store.append(&[put(json!({"objectID": "3", "name": "Desk"}))]).unwrap();
-        drop(store);
-        let (reopened, _) = IndexStore::open(dir.path()).unwrap();
-        assert_eq!(names(&reopened), ["Kettle", "Desk"]);
+        write(&mut loaded.index, &mut loaded.store, 1, vec![put(json!({"objectID": "3", "name": "Desk"}))]);
+        drop(loaded);
+        let loaded = IndexStore::open(dir.path()).unwrap();
+        assert_eq!(names(&loaded.index), ["Kettle", "Desk"]);
+        assert_eq!(loaded.seq, 2);
     }
 
     #[test]
     fn damage_before_the_end_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::new(Settings::default());
-        let mut store = IndexStore::create(dir.path(), &index).unwrap();
-        write(&mut index, &mut store, &[
+        let mut store = IndexStore::create(dir.path(), &index, 0, 1).unwrap();
+        write(&mut index, &mut store, 0, vec![
             put(json!({"objectID": "1", "name": "Kettle"})),
             put(json!({"objectID": "2", "name": "Lamp"})),
         ]);
@@ -421,7 +523,22 @@ mod tests {
         fs::write(&wal, bytes).unwrap();
         match IndexStore::open(dir.path()) {
             Err(StorageError::Corrupt(msg)) => assert!(msg.ends_with("line 1 is damaged"), "{msg}"),
-            other => panic!("expected corruption, got {:?}", other.err()),
+            Err(e) => panic!("expected corruption, got {e}"),
+            Ok(_) => panic!("expected corruption"),
+        }
+    }
+
+    #[test]
+    fn a_gap_in_sequence_numbers_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::new(Settings::default());
+        let mut store = IndexStore::create(dir.path(), &index, 0, 1).unwrap();
+        write(&mut index, &mut store, 0, vec![put(json!({"objectID": "1"}))]);
+        write(&mut index, &mut store, 5, vec![put(json!({"objectID": "2"}))]);
+        drop(store);
+        match IndexStore::open(dir.path()) {
+            Err(StorageError::Corrupt(msg)) => assert!(msg.contains("expected 2"), "{msg}"),
+            _ => panic!("expected corruption"),
         }
     }
 
@@ -429,33 +546,68 @@ mod tests {
     fn snapshot_starts_a_new_generation() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::new(settings());
-        let mut store = IndexStore::create(dir.path(), &index).unwrap();
-        write(&mut index, &mut store, &[put(json!({"objectID": "1", "name": "Kettle", "rating": 2}))]);
-        store.snapshot(&index).unwrap();
-        write(&mut index, &mut store, &[put(json!({"objectID": "2", "name": "Lamp", "rating": 5}))]);
+        let mut store = IndexStore::create(dir.path(), &index, 0, 9).unwrap();
+        let seq = write(&mut index, &mut store, 0, vec![put(json!({"objectID": "1", "name": "Kettle", "rating": 2}))]);
+        store.snapshot(&index, seq, 9).unwrap();
+        write(&mut index, &mut store, seq, vec![put(json!({"objectID": "2", "name": "Lamp", "rating": 5}))]);
         assert_eq!(store.generation(), 2);
         let mut files: Vec<String> =
             fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         files.sort();
         assert_eq!(files, ["snapshot-2.jsonl", "wal-2.log"]);
         drop(store);
-        let (reopened, store) = IndexStore::open(dir.path()).unwrap();
-        assert_eq!(names(&reopened), ["Kettle", "Lamp"]);
-        assert_eq!(store.wal_entries, 1);
+        let loaded = IndexStore::open(dir.path()).unwrap();
+        assert_eq!(names(&loaded.index), ["Kettle", "Lamp"]);
+        assert_eq!((loaded.seq, loaded.epoch, loaded.store.wal_entries), (2, 9, 1));
+    }
+
+    #[test]
+    fn version_1_files_are_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exactly what step 9 wrote: no seq or epoch, bare entries in the log.
+        fs::write(
+            snapshot_path(dir.path(), 1),
+            "{\"version\":1,\"settings\":{}}\n{\"objectID\":\"1\",\"name\":\"Kettle\"}\n{\"end\":1}\n",
+        )
+        .unwrap();
+        let body = r#"{"op":"put","record":{"objectID":"2","name":"Lamp"}}"#;
+        fs::write(wal_path(dir.path(), 1), format!("{:08x} {body}\n", crc32fast::hash(body.as_bytes()))).unwrap();
+
+        let loaded = IndexStore::open(dir.path()).unwrap();
+        assert_eq!(names(&loaded.index), ["Kettle", "Lamp"]);
+        assert_eq!(loaded.seq, 1);
+        let epoch = loaded.epoch;
+        drop(loaded);
+        // The upgrade was written as a version 2 snapshot, keeping the epoch.
+        let loaded = IndexStore::open(dir.path()).unwrap();
+        assert_eq!((loaded.seq, loaded.epoch, loaded.store.generation()), (1, epoch, 2));
     }
 
     #[test]
     fn incomplete_snapshot_files_are_ignored_or_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let index = Index::new(Settings::default());
-        drop(IndexStore::create(dir.path(), &index).unwrap());
+        drop(IndexStore::create(dir.path(), &index, 0, 1).unwrap());
         // A leftover temporary file from a crash during snapshotting.
-        fs::write(dir.path().join("snapshot-2.jsonl.tmp"), "{\"version\":1").unwrap();
+        fs::write(dir.path().join("snapshot-2.jsonl.tmp"), "{\"version\":2").unwrap();
         IndexStore::open(dir.path()).unwrap();
         assert!(!dir.path().join("snapshot-2.jsonl.tmp").exists());
         // A snapshot without its trailer is never accepted.
-        fs::write(snapshot_path(dir.path(), 1), "{\"version\":1,\"settings\":{}}\n").unwrap();
+        fs::write(snapshot_path(dir.path(), 1), "{\"version\":2,\"settings\":{},\"seq\":0,\"epoch\":1}\n").unwrap();
         assert!(matches!(IndexStore::open(dir.path()), Err(StorageError::Corrupt(_))));
+    }
+
+    #[test]
+    fn snapshots_stream_through_memory() {
+        let mut index = Index::new(settings());
+        index.add(json!({"objectID": "1", "name": "Kettle"})).unwrap();
+        let mut bytes = Vec::new();
+        write_snapshot_to(&mut bytes, &index, 42, 5).unwrap();
+        let data = read_snapshot_from(&bytes[..], Path::new("memory")).unwrap();
+        assert_eq!((data.seq, data.epoch), (42, Some(5)));
+        assert_eq!(names(&data.index), ["Kettle"]);
+        let cut = &bytes[..bytes.len() - 5];
+        assert!(read_snapshot_from(cut, Path::new("memory")).is_err());
     }
 
     #[test]
@@ -464,12 +616,12 @@ mod tests {
         for name in ["movies", "products"] {
             let mut index = Index::new(Settings::default());
             index.add(json!({"objectID": "1", "name": name})).unwrap();
-            IndexStore::create(&index_dir(root.path(), name), &index).unwrap();
+            IndexStore::create(&index_dir(root.path(), name), &index, 0, 1).unwrap();
         }
         let opened = open_all(root.path()).unwrap();
-        assert_eq!(opened.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(), ["movies", "products"]);
-        let (_, _, store) = opened.into_iter().next().unwrap();
-        store.destroy().unwrap();
+        assert_eq!(opened.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["movies", "products"]);
+        let (_, loaded) = opened.into_iter().next().unwrap();
+        loaded.store.destroy().unwrap();
         assert_eq!(open_all(root.path()).unwrap().len(), 1);
     }
 }
