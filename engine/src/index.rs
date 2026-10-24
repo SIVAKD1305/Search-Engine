@@ -20,7 +20,7 @@ use crate::typo::TypoSettings;
 use serde::{Deserialize, Serialize};
 use roaring::RoaringBitmap;
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
 
 /// Index of an attribute in `searchable_attributes`; lower ranks higher.
@@ -38,6 +38,24 @@ pub struct Postings {
     pub docs: RoaringBitmap,
     /// Hits per record, sorted by (attribute, position).
     pub hits: HashMap<DocId, Vec<Hit>>,
+    /// Records containing the word in each attribute (indexed by AttributeId).
+    pub by_attribute: Vec<RoaringBitmap>,
+}
+
+/// Records containing a word that starts with a given prefix.
+#[derive(Debug, Default)]
+pub struct PrefixDocs {
+    pub docs: RoaringBitmap,
+    /// The same, per attribute (indexed by AttributeId).
+    pub by_attribute: Vec<RoaringBitmap>,
+}
+
+fn insert_in_attribute(sets: &mut Vec<RoaringBitmap>, attribute: AttributeId, id: DocId) {
+    let a = usize::from(attribute);
+    if sets.len() <= a {
+        sets.resize_with(a + 1, RoaringBitmap::new);
+    }
+    sets[a].insert(id);
 }
 
 /// Index settings, read from JSON with Algolia's names, e.g.
@@ -82,13 +100,16 @@ pub struct Index {
     settings: Settings,
     attributes: Vec<String>,
     words: BTreeMap<String, Postings>,
-    prefixes: HashMap<String, RoaringBitmap>,
+    prefixes: HashMap<String, PrefixDocs>,
     facets: FacetIndex,
     numbers: NumericIndex,
     /// Ids of all live records.
     live: RoaringBitmap,
     /// Normalized word -> words it can stand for, from `settings.synonyms`.
     synonym_map: HashMap<String, Vec<String>>,
+    /// One column per `customRanking` rule: the rule's value for each DocId
+    /// (NaN when missing), so ranking never reads record JSON.
+    custom_columns: Vec<Vec<f64>>,
 }
 
 impl Index {
@@ -96,7 +117,8 @@ impl Index {
         let attributes = settings.searchable_attributes.clone().unwrap_or_default();
         let facets = FacetIndex::new(&settings.attributes_for_faceting);
         let synonym_map = synonyms::build_map(&settings.synonyms);
-        Index { settings, attributes, facets, synonym_map, ..Default::default() }
+        let custom_columns = vec![Vec::new(); settings.custom_ranking.len()];
+        Index { settings, attributes, facets, synonym_map, custom_columns, ..Default::default() }
     }
 
     pub fn store(&self) -> &DocumentStore {
@@ -184,7 +206,12 @@ impl Index {
 
     /// Records containing a word that starts with this (normalized) prefix.
     pub fn prefix_docs(&self, prefix: &str) -> Option<&RoaringBitmap> {
-        self.prefixes.get(prefix)
+        self.prefixes.get(prefix).map(|p| &p.docs)
+    }
+
+    /// Records containing a word that starts with `prefix`, per attribute.
+    pub fn prefix_docs_by_attribute(&self, prefix: &str) -> &[RoaringBitmap] {
+        self.prefixes.get(prefix).map_or(&[], |p| p.by_attribute.as_slice())
     }
 
     /// Dictionary words starting with `prefix`, in sorted order.
@@ -261,8 +288,20 @@ impl Index {
         fields
     }
 
+    /// Value of `customRanking` rule `rule` for a record, if it has one.
+    pub fn custom_value(&self, rule: usize, doc: DocId) -> Option<f64> {
+        let value = *self.custom_columns.get(rule)?.get(doc as usize)?;
+        (!value.is_nan()).then_some(value)
+    }
+
     fn index(&mut self, id: DocId, doc: &Map<String, Value>) {
         self.live.insert(id);
+        for (rule, column) in self.settings.custom_ranking.iter().zip(&mut self.custom_columns) {
+            if column.len() <= id as usize {
+                column.resize(id as usize + 1, f64::NAN);
+            }
+            column[id as usize] = doc.get(&rule.attribute).and_then(Value::as_f64).unwrap_or(f64::NAN);
+        }
         self.facets.add(id, doc);
         self.numbers.add(id, doc);
         let mut hits: HashMap<String, Vec<Hit>> = HashMap::new();
@@ -272,21 +311,30 @@ impl Index {
             }
         }
 
-        let prefixes: HashSet<&str> = hits.keys().flat_map(|w| prefixes_of(w)).collect();
-        for prefix in prefixes {
-            match self.prefixes.get_mut(prefix) {
-                Some(docs) => {
-                    docs.insert(id);
-                }
-                None => {
-                    self.prefixes.insert(prefix.to_owned(), RoaringBitmap::from_iter([id]));
-                }
+        // Attributes in which each prefix of this record's words occurs.
+        let mut prefixes: HashMap<&str, BTreeSet<AttributeId>> = HashMap::new();
+        for (word, word_hits) in &hits {
+            for prefix in prefixes_of(word) {
+                prefixes.entry(prefix).or_default().extend(word_hits.iter().map(|h| h.attribute));
+            }
+        }
+        for (prefix, attributes) in prefixes {
+            if !self.prefixes.contains_key(prefix) {
+                self.prefixes.insert(prefix.to_owned(), PrefixDocs::default());
+            }
+            let entry = self.prefixes.get_mut(prefix).expect("just ensured");
+            entry.docs.insert(id);
+            for attribute in attributes {
+                insert_in_attribute(&mut entry.by_attribute, attribute, id);
             }
         }
         for (word, mut word_hits) in hits {
             word_hits.sort_unstable_by_key(|h| (h.attribute, h.position));
             let postings = self.words.entry(word).or_default();
             postings.docs.insert(id);
+            for h in &word_hits {
+                insert_in_attribute(&mut postings.by_attribute, h.attribute, id);
+            }
             postings.hits.insert(id, word_hits);
         }
     }
@@ -295,6 +343,11 @@ impl Index {
     /// words, so no per-record word list has to be kept in memory.
     fn unindex(&mut self, id: DocId, old: &Map<String, Value>) {
         self.live.remove(id);
+        for column in &mut self.custom_columns {
+            if let Some(value) = column.get_mut(id as usize) {
+                *value = f64::NAN;
+            }
+        }
         self.facets.remove(id, old);
         self.numbers.remove(id, old);
         let mut words = HashSet::new();
@@ -309,15 +362,21 @@ impl Index {
             if let Some(postings) = self.words.get_mut(word) {
                 postings.docs.remove(id);
                 postings.hits.remove(&id);
+                for set in &mut postings.by_attribute {
+                    set.remove(id);
+                }
                 if postings.docs.is_empty() {
                     self.words.remove(word);
                 }
             }
         }
         for prefix in prefixes {
-            if let Some(docs) = self.prefixes.get_mut(prefix) {
-                docs.remove(id);
-                if docs.is_empty() {
+            if let Some(entry) = self.prefixes.get_mut(prefix) {
+                entry.docs.remove(id);
+                for set in &mut entry.by_attribute {
+                    set.remove(id);
+                }
+                if entry.docs.is_empty() {
                     self.prefixes.remove(prefix);
                 }
             }

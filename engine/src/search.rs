@@ -13,7 +13,8 @@ use crate::filter::{self, FilterError};
 use crate::highlight::{self, HighlightTags, Matcher};
 use crate::index::{Index, Settings};
 use crate::language::{is_stop_word, plural_forms};
-use crate::ranking::{RankingInfo, rank};
+use crate::bucket::rank_page;
+use crate::ranking::RankingInfo;
 use crate::store::DocId;
 use crate::tokenizer::{normalize, tokenize};
 use crate::typo::{WordMatch, fuzzy_matches};
@@ -329,9 +330,9 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
         }
     }
 
-    let ranked = rank(index, &terms, &candidates, &boosts);
     let nb_hits = candidates.len();
-    let page = ranked.into_iter().skip(params.page.saturating_mul(hits_per_page)).take(hits_per_page);
+    let offset = params.page.saturating_mul(hits_per_page);
+    let page = rank_page(index, &terms, &candidates, &boosts, offset, hits_per_page).into_iter();
 
     let matcher = Matcher::new(&terms);
     let tags = HighlightTags {

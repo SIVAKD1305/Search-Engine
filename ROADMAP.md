@@ -24,6 +24,21 @@
     epochs, `--replica-of`, log shipping with long-poll, snapshot copy when
     too far behind, replicas persist, refuse writes, report lag
 
+## Ground work (before 11b)
+
+1. ✅ Speed on large result sets: staged ranking (bucket sort) that refines only
+   the groups that can reach the requested page, custom-ranking values in
+   columns, per-attribute word and prefix sets. Checked against the full
+   ranking by a randomized test. 10k products: empty query 6.7 → 0.34 ms,
+   "s" (8,242 hits) 7.7 → 1.0 ms, "h" (4,772 hits) 4.7 → 0.7 ms; memory
+   40 → 46 MB.
+2. Load test with a real load generator, and a large dataset (1M records)
+3. Typo speed on big dictionaries; cheaper highlighting
+4. Group commit for single writes; faster startup
+5. Chinese/Japanese word segmentation
+6. Secured API keys and rate limiting
+7. Geo search, facet stats, multi-word synonyms
+
 ## Next
 
 11b. Automatic failover: 3 nodes agree on every write (Raft) and elect a new
@@ -68,11 +83,6 @@
   `is_unspaced_script`). Replace it with a dictionary-based segmenter such as
   `lindera` (Japanese, also Chinese/Korean dictionaries) or `jieba-rs`
   (Chinese). Korean is space-separated and already works at word level.
-- Ranking cost on big result sets: every candidate is fully scored and
-  sorted, so "h" (4,772 hits) takes about 7.6 ms and the empty query (10,000)
-  about 11 ms. Do what Algolia does: apply criteria lazily as a bucket sort
-  (split by typo count with bitmaps first, score deeper only inside the
-  buckets needed for the requested page), plus a fast path for the empty query.
 - Typo-tolerance timings in step 4 were measured with prices indexed (8,964
   words). With `config/products.json` the dictionary has 141 words, so
   re-measure on a large real vocabulary before trusting the speed.

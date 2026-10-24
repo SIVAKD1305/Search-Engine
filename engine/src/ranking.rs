@@ -17,7 +17,6 @@ use crate::search::QueryTerm;
 use crate::store::DocId;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::cmp::Ordering;
 
 /// Words further apart than this, or in different attributes, all count as
@@ -143,8 +142,7 @@ pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boos
                 cell.hits.sort_unstable_by_key(|h| (h.attribute, h.position));
                 cell.hits.dedup();
             }
-            let record = index.store().get(doc).expect("candidate is live");
-            let mut info = ranking_info(row, record, &settings.custom_ranking);
+            let mut info = ranking_info(row, index, doc, settings.custom_ranking.len());
             info.filters = boosts.iter().filter(|b| b.contains(doc)).count() as u32;
             RankedDoc { doc, info }
         })
@@ -162,7 +160,7 @@ pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boos
     ranked
 }
 
-fn ranking_info(row: &[TermInDoc], record: &Map<String, Value>, custom: &[CustomRule]) -> RankingInfo {
+fn ranking_info(row: &[TermInDoc], index: &Index, doc: DocId, custom_rules: usize) -> RankingInfo {
     let proximity_distance = row
         .windows(2)
         .map(|pair| pair_proximity(&pair[0].hits, &pair[1].hits))
@@ -174,7 +172,7 @@ fn ranking_info(row: &[TermInDoc], record: &Map<String, Value>, custom: &[Custom
         proximity_distance,
         first_matched_attribute: row.iter().flat_map(|c| &c.hits).map(|h| h.attribute).min(),
         nb_exact_words: row.iter().filter(|c| c.exact).count() as u32,
-        custom: custom.iter().map(|rule| record.get(&rule.attribute).and_then(Value::as_f64)).collect(),
+        custom: (0..custom_rules).map(|rule| index.custom_value(rule, doc)).collect(),
     }
 }
 
@@ -182,7 +180,7 @@ fn ranking_info(row: &[TermInDoc], record: &Map<String, Value>, custom: &[Custom
 /// pair of occurrences in the same attribute. Words in the wrong order cost
 /// one more, so "wireless headphones" beats "headphones wireless" for the
 /// query "wireless headphones".
-fn pair_proximity(first: &[Hit], second: &[Hit]) -> u32 {
+pub(crate) fn pair_proximity(first: &[Hit], second: &[Hit]) -> u32 {
     let mut best = MAX_PROXIMITY;
     for a in first {
         for b in second {
@@ -238,6 +236,7 @@ fn missing_last<T>(x: Option<T>, y: Option<T>, cmp: impl FnOnce(T, T) -> Orderin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use crate::index::Settings;
     use crate::search::{SearchParams, SearchResults, search};
     use serde_json::json;
