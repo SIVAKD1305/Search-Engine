@@ -24,7 +24,15 @@ SEARCH_ADMIN_KEY=a SEARCH_SEARCH_KEY=s ./target/release/server --in-memory \
   --port 9201 --load catalog=data/scale/catalog.jsonl,config/catalog.json &
 ./target/release/loadtest --url http://127.0.0.1:9201 --index catalog --key s \
   --queries data/scale/catalog-queries.jsonl --concurrency 1,4,16,64 --seconds 10
+
+# Restart time: start with a data directory, stop with Ctrl-C or SIGTERM
+# (which checkpoints), start again and read "index(es) loaded in ... ms"
+SEARCH_ADMIN_KEY=a SEARCH_SEARCH_KEY=s ./target/release/server --data-dir /tmp/sd \
+  --port 9201 --load catalog=data/scale/catalog.jsonl,config/catalog.json
 ```
+
+Write throughput: `loadtest --write --url ... --index catalog --key ADMIN_KEY`
+(the server must use a data directory, so writes are fsynced).
 
 ## The data
 
@@ -38,7 +46,39 @@ with filters or facets.
 The earlier sample data (`data/products.jsonl`) has only 141 distinct words,
 which hid every cost that grows with the vocabulary.
 
-## Results (October 2026)
+## After the ground work (items 1-5 of the roadmap)
+
+Same machine, same data and queries as the first measurements below.
+
+| | 100k before | 100k now | 1M before | 1M now |
+|---|---|---|---|---|
+| Indexing time | 42 s | 13.8 s | 506 s | 183 s |
+| Memory (resident) | 958 MB | 283 MB | 8,086 MB | 2,281 MB |
+| Query mean | 6.0 ms | 1.8 ms | 24.3 ms | 4.8 ms |
+| Query p50 | 5.5 ms | 1.7 ms | 10.8 ms | 2.8 ms |
+| Query p99 | 17.6 ms | 5.2 ms | 127.4 ms | 32.9 ms |
+| Query max | 32.8 ms | (not measured) | 226.2 ms | 71.0 ms |
+| Queries/s, one core | 167 | 555 | 41 | 209 |
+| Restart | 13 s | 0.7 s | 190 s | 11-14 s |
+
+Restart "before" re-indexes every record from the snapshot; "now" loads the
+index image written next to it (100k: 170 MB, 1M: 1.6 GB). Answers to 300
+sampled queries were byte-for-byte the same either way.
+
+Writes over HTTP at 100k records (`loadtest --write`, each request one
+record, acknowledged after fsync):
+
+| Writers | Before group commit | With group commit |
+|---|---|---|
+| 1 | 1,695 writes/s | 1,360 writes/s |
+| 16 | 1,891 writes/s | 5,068 writes/s |
+| 64 | 1,791 writes/s | 4,782 writes/s |
+
+The slowest queries at 1M are all facet counts over 150k-220k hits
+(`brand` and `category` together, 45-70 ms). Approximate counts on very
+large results, as Algolia does, are the next fix there.
+
+## First measurements (October 2026)
 
 ### Scale, in-process (one core, 5,000 sampled queries)
 
@@ -82,7 +122,7 @@ the cores are full and further requests wait in line. The server's own
 
 (Stages are timed separately, so they do not add up exactly.)
 
-## Findings
+## Findings (from the first measurements; fixed in items 3-5)
 
 1. **Huge result sets.** Queries matching a large share of the catalog
    (`s`, `p`, a very common word: 600k–990k hits at 1M) take 160–226 ms.

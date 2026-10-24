@@ -128,6 +128,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     println!("listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, app(state)).await?;
+    axum::serve(listener, app(state.clone())).with_graceful_shutdown(shutdown_signal()).await?;
+    if data_dir.is_some() {
+        let start = Instant::now();
+        state.checkpoint()?;
+        println!("checkpointed in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
     Ok(())
+}
+
+/// Ctrl-C or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("Ctrl-C handler") };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler").recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    println!("shutting down");
 }

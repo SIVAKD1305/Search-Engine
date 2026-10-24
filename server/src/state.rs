@@ -439,6 +439,22 @@ impl AppState {
         Ok(())
     }
 
+    /// Writes a fresh snapshot (and image) of every index whose log holds
+    /// changes, so the next start reads images and replays nothing. Called
+    /// on shutdown; writes wait meanwhile, searches do not.
+    pub fn checkpoint(&self) -> Result<(), StorageError> {
+        for (_, entry) in self.indexes() {
+            let mut log = entry.log.lock().unwrap();
+            let (seq, epoch) = (log.seq, log.epoch);
+            if let Some(store) = log.store.as_mut()
+                && store.has_log_entries()
+            {
+                store.snapshot(&entry.index.read().unwrap(), seq, epoch)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Changes with sequence numbers from `from`, at most `limit` of them.
     /// `None` when they are no longer kept in memory.
     pub fn log_since(&self, name: &str, from: u64, limit: usize) -> Result<Option<LogSlice>, ApiError> {

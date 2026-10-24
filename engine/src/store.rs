@@ -47,7 +47,7 @@ pub struct Upserted {
     pub previous: Option<Map<String, Value>>,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Deserialize, serde::Serialize)]
 pub struct DocumentStore {
     /// Compact JSON per DocId; `None` marks a deleted record.
     docs: Vec<Option<Box<str>>>,

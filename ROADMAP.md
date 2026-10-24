@@ -46,8 +46,15 @@
    fast path in the tokenizer; numeric range filters from three levels of
    precomputed buckets (100k catalog: mean 5.1 -> 1.9 ms, p99 12.9 -> 5.4 ms,
    529 queries/s per core)
-5. Indexing speed and memory; group commit for single writes; faster
-   startup (findings 4 and 5)
+5. ✅ Indexing speed, memory and startup: records stored as compact JSON
+   text, capped prefix sets (up to 4 characters), occurrence lists instead of
+   per-word position maps; group commit (one fsync for all writes that
+   arrive together); an index image next to each snapshot so startup loads
+   the built index instead of re-indexing, and a checkpoint on shutdown.
+   100k catalog: indexing 38.6 -> 13.8 s, memory 958 -> 283 MB, restart
+   13.0 -> 0.7 s, 16 concurrent writers 1,891 -> 5,068 writes/s. 1M catalog:
+   indexing 506 -> 183 s, memory 8.1 -> 2.3 GB, p99 127 -> 33 ms, restart
+   190 -> 11-14 s.
 6. Chinese/Japanese word segmentation
 7. Secured API keys and rate limiting
 8. Geo search, facet stats, multi-word synonyms
@@ -63,12 +70,14 @@
   1 ms for 5 hits. Snippet window search allocates a set per window; use a
   sliding count instead. Consider highlighting only the snippet window when
   an attribute is snippeted.
-- Startup re-indexes every record from the snapshot (10k products: about
-  0.6 s). For large indexes, save the built index structures (dictionary,
-  postings, bitmaps) instead of only the records, e.g. as memory-mapped files.
-- Each single-record write waits for its own fsync (about 11 ms per request in
-  this container, including curl). Group commit (one fsync for writes that
-  arrive together) would raise write throughput; batches already share one.
+- Startup at 1M records takes 11-14 s even from the image (1.6 GB, decoded
+  into many small allocations). Memory-mapping a flat layout would make it
+  near instant. Compaction (every 10,000 writes) writes the snapshot and
+  image while holding the write log: writes pause about 1.7 s at 100k
+  records (searches continue). Write snapshots in the background from a
+  copy-on-write view instead.
+- Group commit raised write throughput 2.7x at 16 writers; a single writer
+  still waits for its own fsync (about 0.7 ms here).
 - Replication gaps: a replica that was disconnected retries with backoff
   up to 10 s, so catch-up after an outage can take that long; replicas use the
   primary's admin key (a dedicated replication key would be safer); the

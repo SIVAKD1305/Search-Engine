@@ -46,7 +46,7 @@ pub const MAX_STORED_PREFIX: usize = 4;
 /// A dictionary word's permanent number; ids of removed words are not reused.
 pub type WordId = u32;
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Postings {
     pub id: WordId,
     pub word: String,
@@ -56,7 +56,7 @@ pub struct Postings {
 }
 
 /// One word of a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Occurrence {
     pub word: WordId,
     pub attribute: AttributeId,
@@ -70,7 +70,7 @@ impl Occurrence {
 }
 
 /// Records containing a word that starts with a given prefix.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PrefixDocs {
     pub docs: RoaringBitmap,
     /// The same, per attribute (indexed by AttributeId).
@@ -143,14 +143,18 @@ pub struct IndexStats {
     pub hits: usize,
 }
 
-#[derive(Default)]
+/// `Serialize` writes an index image (see `write_image`); the skipped
+/// fields are rebuilt when it is read.
+#[derive(Default, Deserialize, Serialize)]
 pub struct Index {
     store: DocumentStore,
+    #[serde(skip)]
     settings: Settings,
     attributes: Vec<String>,
     /// The dictionary in sorted order, for typo walks and prefix ranges.
     words: BTreeMap<String, WordId>,
     /// The same, for fast exact lookups.
+    #[serde(skip)]
     word_ids: FxHashMap<String, WordId>,
     /// Indexed by WordId; `None` for removed words.
     postings: Vec<Option<Postings>>,
@@ -160,6 +164,7 @@ pub struct Index {
     /// Ids of all live records.
     live: RoaringBitmap,
     /// Normalized word -> words it can stand for, from `settings.synonyms`.
+    #[serde(skip)]
     synonym_map: HashMap<String, Vec<String>>,
     /// One column per `customRanking` rule: the rule's value for each DocId
     /// (NaN when missing), so ranking never reads record JSON.
@@ -171,6 +176,10 @@ pub struct Index {
     /// write (only with 1 to MAX_ORDERED_RULES rules).
     custom_order: BTreeSet<(CustomKey, DocId)>,
 }
+
+/// Changes whenever the layout of `Index` (or anything inside it) changes,
+/// so an old image is rejected instead of misread.
+const IMAGE_VERSION: u32 = 1;
 
 /// Records with up to this many `customRanking` rules keep a sorted order.
 pub const MAX_ORDERED_RULES: usize = 4;
@@ -270,6 +279,29 @@ impl Index {
             loaded += 1;
         }
         Ok(loaded)
+    }
+
+    /// Writes the built index in a binary form that `read_image` loads
+    /// without re-indexing any record.
+    pub fn write_image(&self, out: impl std::io::Write) -> std::io::Result<()> {
+        // Settings use serde features (flatten) that bincode cannot read
+        // back, so they travel as JSON.
+        let settings = serde_json::to_string(&self.settings).expect("settings serialize");
+        bincode::serialize_into(out, &(IMAGE_VERSION, settings, self)).map_err(std::io::Error::other)
+    }
+
+    /// Reads an image written by `write_image` by the same engine version.
+    pub fn read_image(input: impl std::io::Read) -> std::io::Result<Index> {
+        let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+        let (version, settings, mut index): (u32, String, Index) =
+            bincode::deserialize_from(input).map_err(|e| invalid(e.to_string()))?;
+        if version != IMAGE_VERSION {
+            return Err(invalid(format!("image version {version}, expected {IMAGE_VERSION}")));
+        }
+        index.settings = serde_json::from_str(&settings).map_err(|e| invalid(e.to_string()))?;
+        index.synonym_map = synonyms::build_map(&index.settings.synonyms);
+        index.word_ids = index.words.iter().map(|(w, &id)| (w.clone(), id)).collect();
+        Ok(index)
     }
 
     /// Records containing exactly this (normalized) word.
@@ -705,5 +737,52 @@ mod tests {
         assert_eq!(order(&index), ["a", "b", "d"]);
         assert!(Index::new(Settings::default()).custom_order().is_none());
     }
-}
 
+    #[test]
+    fn an_image_reloads_to_the_same_index() {
+        use crate::search::{SearchParams, search};
+        let settings: Settings = serde_json::from_value(json!({
+            "searchableAttributes": ["name", "brand"],
+            "customRanking": ["desc(rating)"],
+            "attributesForFaceting": ["brand", "rating"],
+            "synonyms": [{"type": "synonym", "synonyms": ["phone", "mobile"]}],
+            "ignorePlurals": true
+        }))
+        .unwrap();
+        let mut index = Index::new(settings);
+        let brands = ["Orbix", "Lumen", "Vexa"];
+        let nouns = ["phone", "kettle", "lamp", "headphones", "stand"];
+        for i in 0..300 {
+            let name = format!("{} {} model {}", brands[i % 3], nouns[i % 5], i % 17);
+            index.add(json!({"objectID": i.to_string(), "name": name, "brand": brands[i % 3], "rating": i % 5})).unwrap();
+        }
+        for i in (0..300).step_by(7) {
+            index.delete(&i.to_string());
+        }
+        let mut image = Vec::new();
+        index.write_image(&mut image).unwrap();
+        let mut reloaded = Index::read_image(&image[..]).unwrap();
+        assert_eq!(reloaded.stats(), index.stats());
+
+        let same = |a: &Index, b: &Index| {
+            for query in ["", "orbix", "mobile", "lamps", "ketle", "head", "vexa st", "model 3"] {
+                let mut params = SearchParams::new(query);
+                params.facets = vec!["brand".into()];
+                params.filters = Some("rating >= 2".into());
+                let (x, y) = (search(a, &params).unwrap(), search(b, &params).unwrap());
+                assert_eq!(x.nb_hits, y.nb_hits, "{query}");
+                assert_eq!(format!("{:?}{:?}", x.hits, x.facets), format!("{:?}{:?}", y.hits, y.facets), "{query}");
+            }
+        };
+        same(&index, &reloaded);
+        // Both keep accepting the same writes with the same results.
+        for target in [&mut index, &mut reloaded] {
+            target.add(json!({"objectID": "7", "name": "Lumen phone stand", "brand": "Lumen", "rating": 4})).unwrap();
+            target.add(json!({"objectID": "1000", "name": "Brand new kettle", "brand": "Zeta", "rating": 3})).unwrap();
+            target.delete("2");
+        }
+        same(&index, &reloaded);
+
+        assert!(Index::read_image(&image[..image.len() / 2]).is_err());
+    }
+}
