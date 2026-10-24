@@ -379,7 +379,7 @@ mod tests {
         let terms = plan(&index, "usb 1996");
         let tags = HighlightTags { pre: "[".into(), post: "]".into(), ellipsis: "...".into() };
         let record = index.store().get(0).unwrap();
-        let r = highlight(record, &["features".into(), "year".into(), "missing".into()], &Matcher::new(&terms), &tags, |_| true);
+        let r = highlight(&record, &["features".into(), "year".into(), "missing".into()], &Matcher::new(&terms), &tags, |_| true);
         assert_eq!(r["features"][0]["value"], "fast charging");
         assert_eq!(r["features"][1]["value"], "[USB]-C");
         assert_eq!(r["year"]["value"], "[1996]");

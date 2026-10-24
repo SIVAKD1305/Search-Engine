@@ -23,7 +23,9 @@ use crate::typo::TypoSettings;
 use serde::{Deserialize, Serialize};
 use roaring::RoaringBitmap;
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 /// Index of an attribute in `searchable_attributes`; lower ranks higher.
@@ -36,12 +38,18 @@ pub struct Hit {
     pub position: u32,
 }
 
+/// Prefixes up to this many characters have precomputed record sets. Longer
+/// prefixes are shared by few words, so they are computed when queried; this
+/// keeps indexing fast and memory low (Algolia makes the same trade-off).
+pub const MAX_STORED_PREFIX: usize = 4;
+
 /// A dictionary word's permanent number; ids of removed words are not reused.
 pub type WordId = u32;
 
 #[derive(Debug)]
 pub struct Postings {
     pub id: WordId,
+    pub word: String,
     pub docs: RoaringBitmap,
     /// Records containing the word in each attribute (indexed by AttributeId).
     pub by_attribute: Vec<RoaringBitmap>,
@@ -67,6 +75,28 @@ pub struct PrefixDocs {
     pub docs: RoaringBitmap,
     /// The same, per attribute (indexed by AttributeId).
     pub by_attribute: Vec<RoaringBitmap>,
+}
+
+/// A small set of attribute ids: a bit mask for the first 64, a list for
+/// the rare rest. Allocates nothing in the common case.
+#[derive(Default)]
+struct AttributeSet {
+    mask: u64,
+    more: Vec<AttributeId>,
+}
+
+impl AttributeSet {
+    fn insert(&mut self, a: AttributeId) {
+        if a < 64 {
+            self.mask |= 1 << a;
+        } else if !self.more.contains(&a) {
+            self.more.push(a);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = AttributeId> + '_ {
+        (0..64u16).filter(|a| self.mask & (1 << a) != 0).chain(self.more.iter().copied())
+    }
 }
 
 fn insert_in_attribute(sets: &mut Vec<RoaringBitmap>, attribute: AttributeId, id: DocId) {
@@ -118,8 +148,13 @@ pub struct Index {
     store: DocumentStore,
     settings: Settings,
     attributes: Vec<String>,
-    words: BTreeMap<String, Postings>,
-    prefixes: HashMap<String, PrefixDocs>,
+    /// The dictionary in sorted order, for typo walks and prefix ranges.
+    words: BTreeMap<String, WordId>,
+    /// The same, for fast exact lookups.
+    word_ids: FxHashMap<String, WordId>,
+    /// Indexed by WordId; `None` for removed words.
+    postings: Vec<Option<Postings>>,
+    prefixes: FxHashMap<String, PrefixDocs>,
     facets: FacetIndex,
     numbers: NumericIndex,
     /// Ids of all live records.
@@ -174,7 +209,7 @@ impl Index {
     }
 
     /// The sorted word dictionary, for typo-tolerant lookups.
-    pub fn dictionary(&self) -> &BTreeMap<String, Postings> {
+    pub fn dictionary(&self) -> &BTreeMap<String, WordId> {
         &self.words
     }
 
@@ -184,13 +219,12 @@ impl Index {
 
     /// Adds or replaces a record (matched by objectID).
     pub fn add(&mut self, record: Value) -> Result<DocId, StoreError> {
-        let (id, previous) = self.store.upsert(record)?;
-        if let Some(old) = previous {
-            self.unindex(id, &old);
+        let upserted = self.store.upsert(record)?;
+        if let Some(old) = &upserted.previous {
+            self.unindex(upserted.id, old);
         }
-        let doc = self.store.get(id).expect("just inserted").clone();
-        self.index(id, &doc);
-        Ok(id)
+        self.index(upserted.id, &upserted.record);
+        Ok(upserted.id)
     }
 
     /// Removes a record. Returns false if no record has that objectID.
@@ -206,7 +240,7 @@ impl Index {
 
     /// Replaces the settings and re-indexes every record, keeping their order.
     pub fn set_settings(&mut self, settings: Settings) {
-        let records: Vec<Value> = self.store.iter().map(|(_, r)| Value::Object(r.clone())).collect();
+        let records: Vec<Value> = self.store.iter().map(|(_, r)| Value::Object(r)).collect();
         *self = Index::new(settings);
         for record in records {
             self.add(record).expect("stored records are valid");
@@ -219,7 +253,7 @@ impl Index {
     }
 
     /// The stored record with this objectID.
-    pub fn get_object(&self, object_id: &str) -> Option<&Map<String, Value>> {
+    pub fn get_object(&self, object_id: &str) -> Option<Map<String, Value>> {
         self.store.get(self.store.id_of(object_id)?)
     }
 
@@ -240,12 +274,26 @@ impl Index {
 
     /// Records containing exactly this (normalized) word.
     pub fn word(&self, word: &str) -> Option<&Postings> {
-        self.words.get(word)
+        let id = *self.word_ids.get(word)?;
+        self.postings[id as usize].as_ref()
     }
 
     /// Records containing a word that starts with this (normalized) prefix.
-    pub fn prefix_docs(&self, prefix: &str) -> Option<&RoaringBitmap> {
-        self.prefixes.get(prefix).map(|p| &p.docs)
+    /// Short prefixes are precomputed; longer ones are the union of the few
+    /// words starting with them.
+    pub fn prefix_docs(&self, prefix: &str) -> Option<Cow<'_, RoaringBitmap>> {
+        if prefix.chars().count() <= MAX_STORED_PREFIX {
+            return self.prefixes.get(prefix).map(|p| Cow::Borrowed(&p.docs));
+        }
+        let mut docs = RoaringBitmap::new();
+        let mut any = false;
+        for id in self.word_ids_with_prefix(prefix) {
+            if let Some(postings) = &self.postings[id as usize] {
+                docs |= &postings.docs;
+                any = true;
+            }
+        }
+        any.then_some(Cow::Owned(docs))
     }
 
     /// A record's words in reading order (empty for deleted records).
@@ -259,8 +307,21 @@ impl Index {
     }
 
     /// Records containing a word that starts with `prefix`, per attribute.
-    pub fn prefix_docs_by_attribute(&self, prefix: &str) -> &[RoaringBitmap] {
-        self.prefixes.get(prefix).map_or(&[], |p| p.by_attribute.as_slice())
+    pub fn prefix_docs_by_attribute(&self, prefix: &str) -> Cow<'_, [RoaringBitmap]> {
+        if prefix.chars().count() <= MAX_STORED_PREFIX {
+            return Cow::Borrowed(self.prefixes.get(prefix).map_or(&[], |p| p.by_attribute.as_slice()));
+        }
+        let mut sets: Vec<RoaringBitmap> = Vec::new();
+        for id in self.word_ids_with_prefix(prefix) {
+            let Some(postings) = &self.postings[id as usize] else { continue };
+            if sets.len() < postings.by_attribute.len() {
+                sets.resize_with(postings.by_attribute.len(), RoaringBitmap::new);
+            }
+            for (set, docs) in sets.iter_mut().zip(&postings.by_attribute) {
+                *set |= docs;
+            }
+        }
+        Cow::Owned(sets)
     }
 
     /// Ids of the dictionary words starting with `prefix`.
@@ -268,7 +329,7 @@ impl Index {
         self.words
             .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
             .take_while(move |(w, _)| w.starts_with(prefix))
-            .map(|(_, p)| p.id)
+            .map(|(_, &id)| id)
     }
 
     /// Dictionary words starting with `prefix`, in sorted order.
@@ -394,7 +455,7 @@ impl Index {
         }
         self.facets.add(id, doc);
         self.numbers.add(id, doc);
-        let mut hits: HashMap<String, Vec<Hit>> = HashMap::new();
+        let mut hits: FxHashMap<String, Vec<Hit>> = FxHashMap::default();
         for (attribute, value) in self.searchable_fields(doc) {
             for token in tokenize_value(value) {
                 hits.entry(token.text).or_default().push(Hit { attribute, position: token.position });
@@ -402,10 +463,13 @@ impl Index {
         }
 
         // Attributes in which each prefix of this record's words occurs.
-        let mut prefixes: HashMap<&str, BTreeSet<AttributeId>> = HashMap::new();
+        let mut prefixes: FxHashMap<&str, AttributeSet> = FxHashMap::default();
         for (word, word_hits) in &hits {
-            for prefix in prefixes_of(word) {
-                prefixes.entry(prefix).or_default().extend(word_hits.iter().map(|h| h.attribute));
+            for prefix in prefixes_of(word).take(MAX_STORED_PREFIX) {
+                let set = prefixes.entry(prefix).or_default();
+                for h in word_hits {
+                    set.insert(h.attribute);
+                }
             }
         }
         for (prefix, attributes) in prefixes {
@@ -414,22 +478,33 @@ impl Index {
             }
             let entry = self.prefixes.get_mut(prefix).expect("just ensured");
             entry.docs.insert(id);
-            for attribute in attributes {
+            for attribute in attributes.iter() {
                 insert_in_attribute(&mut entry.by_attribute, attribute, id);
             }
         }
         let mut occurrences = Vec::with_capacity(hits.values().map(Vec::len).sum());
         for (word, word_hits) in hits {
-            if !self.words.contains_key(&word) {
-                let postings = Postings { id: self.next_word_id, docs: RoaringBitmap::new(), by_attribute: Vec::new() };
-                self.next_word_id += 1;
-                self.words.insert(word.clone(), postings);
-            }
-            let postings = self.words.get_mut(&word).expect("just ensured");
+            let word_id = match self.word_ids.get(&word) {
+                Some(&word_id) => word_id,
+                None => {
+                    let word_id = self.next_word_id;
+                    self.next_word_id += 1;
+                    self.words.insert(word.clone(), word_id);
+                    self.word_ids.insert(word.clone(), word_id);
+                    self.postings.push(Some(Postings {
+                        id: word_id,
+                        word,
+                        docs: RoaringBitmap::new(),
+                        by_attribute: Vec::new(),
+                    }));
+                    word_id
+                }
+            };
+            let postings = self.postings[word_id as usize].as_mut().expect("live word");
             postings.docs.insert(id);
             for h in &word_hits {
                 insert_in_attribute(&mut postings.by_attribute, h.attribute, id);
-                occurrences.push(Occurrence { word: postings.id, attribute: h.attribute, position: h.position });
+                occurrences.push(Occurrence { word: word_id, attribute: h.attribute, position: h.position });
             }
         }
         occurrences.sort_unstable_by_key(|o| (o.attribute, o.position));
@@ -454,36 +529,40 @@ impl Index {
         }
         self.facets.remove(id);
         self.numbers.remove(id, old);
-        if let Some(list) = self.occurrences.get_mut(id as usize) {
-            *list = Vec::new();
-        }
-        let mut words = HashSet::new();
-        for (_, value) in self.searchable_fields(old) {
-            words.extend(tokenize_value(value).into_iter().map(|t| t.text));
-        }
+        // The record's word list says which words to remove it from.
+        let old_words: FxHashSet<WordId> = self
+            .occurrences
+            .get_mut(id as usize)
+            .map(std::mem::take)
+            .unwrap_or_default()
+            .iter()
+            .map(|o| o.word)
+            .collect();
         // Removing the record from every prefix of every word it had is safe:
         // the whole record is going away, so no other word of it still needs them.
-        let mut prefixes = HashSet::new();
-        for word in &words {
-            prefixes.extend(prefixes_of(word));
-            if let Some(postings) = self.words.get_mut(word) {
-                postings.docs.remove(id);
-                for set in &mut postings.by_attribute {
-                    set.remove(id);
-                }
-                if postings.docs.is_empty() {
-                    self.words.remove(word);
-                }
+        let mut prefixes: FxHashSet<String> = FxHashSet::default();
+        for word_id in old_words {
+            let slot = &mut self.postings[word_id as usize];
+            let Some(postings) = slot.as_mut() else { continue };
+            prefixes.extend(prefixes_of(&postings.word).take(MAX_STORED_PREFIX).map(str::to_owned));
+            postings.docs.remove(id);
+            for set in &mut postings.by_attribute {
+                set.remove(id);
+            }
+            if postings.docs.is_empty() {
+                let word = slot.take().expect("checked").word;
+                self.words.remove(&word);
+                self.word_ids.remove(&word);
             }
         }
-        for prefix in prefixes {
-            if let Some(entry) = self.prefixes.get_mut(prefix) {
+        for prefix in &prefixes {
+            if let Some(entry) = self.prefixes.get_mut(prefix.as_str()) {
                 entry.docs.remove(id);
                 for set in &mut entry.by_attribute {
                     set.remove(id);
                 }
                 if entry.docs.is_empty() {
-                    self.prefixes.remove(prefix);
+                    self.prefixes.remove(prefix.as_str());
                 }
             }
         }
@@ -539,9 +618,9 @@ mod tests {
     #[test]
     fn prefix_lookup_covers_all_words_with_that_start() {
         let index = sample();
-        assert_eq!(ids(index.prefix_docs("head").unwrap()), [0, 1]);
-        assert_eq!(ids(index.prefix_docs("heads").unwrap()), [1]);
-        assert_eq!(ids(index.prefix_docs("headphones").unwrap()), [0]);
+        assert_eq!(ids(&index.prefix_docs("head").unwrap()), [0, 1]);
+        assert_eq!(ids(&index.prefix_docs("heads").unwrap()), [1]);
+        assert_eq!(ids(&index.prefix_docs("headphones").unwrap()), [0]);
         assert!(index.prefix_docs("headx").is_none());
         let words: Vec<&str> = index.words_with_prefix("head").collect();
         assert_eq!(words, ["headphones", "headset", "headsets"]);
@@ -563,7 +642,7 @@ mod tests {
         let mut index = sample();
         assert!(index.delete("2"));
         assert!(!index.delete("2"));
-        assert_eq!(ids(index.prefix_docs("head").unwrap()), [0]);
+        assert_eq!(ids(&index.prefix_docs("head").unwrap()), [0]);
         assert!(index.prefix_docs("heads").is_none());
         assert_eq!(ids(&index.word("wireless").unwrap().docs), [0]);
         assert_eq!(ids(&index.all_docs()), [0, 2]);

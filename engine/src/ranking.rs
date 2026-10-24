@@ -412,8 +412,8 @@ mod tests {
         let params = |page| SearchParams { page, hits_per_page: 10, ..SearchParams::new("kettle") };
         let page = search(&i, &params(2)).unwrap();
         assert_eq!((page.nb_hits, page.nb_pages, page.hits.len()), (25, 3, 5));
-        let ids: Vec<&str> =
-            page.hits.iter().map(|h| i.store().get(h.doc).unwrap()["objectID"].as_str().unwrap()).collect();
+        let ids: Vec<String> =
+            page.hits.iter().map(|h| i.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned()).collect();
         assert_eq!(ids, ["4", "3", "2", "1", "0"]);
         assert!(search(&i, &params(9)).unwrap().hits.is_empty());
     }

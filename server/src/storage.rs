@@ -129,8 +129,9 @@ pub fn write_snapshot_to(out: &mut impl Write, index: &Index, seq: u64, epoch: u
     serde_json::to_writer(&mut *out, &header)?;
     out.write_all(b"\n")?;
     let mut count = 0u64;
-    for (_, record) in index.store().iter() {
-        serde_json::to_writer(&mut *out, record)?;
+    // Records are stored as compact JSON already: copy them as they are.
+    for (_, record) in index.store().iter_raw() {
+        out.write_all(record.as_bytes())?;
         out.write_all(b"\n")?;
         count += 1;
     }

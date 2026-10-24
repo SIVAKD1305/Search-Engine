@@ -179,6 +179,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "roaring",
+ "rustc-hash",
  "serde",
  "serde_json",
  "unicode-normalization",

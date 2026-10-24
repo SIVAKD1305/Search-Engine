@@ -142,7 +142,7 @@ fn term_docs(index: &Index, matches: &[WordMatch], prefixes: &[PrefixMatch]) -> 
     // A prefix group is one precomputed set, however many words it holds.
     for p in prefixes {
         if let Some(prefix_docs) = index.prefix_docs(&p.prefix) {
-            docs |= prefix_docs;
+            docs |= prefix_docs.as_ref();
         }
     }
     for m in matches {
@@ -368,8 +368,8 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
             SearchHit {
                 doc: r.doc,
                 info: r.info,
-                highlight: highlight::highlight(record, &to_highlight, &matcher, &tags, may_match),
-                snippet: highlight::snippet(record, &params.attributes_to_snippet, &matcher, &tags),
+                highlight: highlight::highlight(&record, &to_highlight, &matcher, &tags, may_match),
+                snippet: highlight::snippet(&record, &params.attributes_to_snippet, &matcher, &tags),
             }
         })
         .collect();
@@ -591,8 +591,11 @@ mod tests {
         let index = shop();
         let params = SearchParams { optional_filters: vec!["brand:Orbix".into()], ..SearchParams::new("kettle") };
         let results = search(&index, &params).unwrap();
-        let order: Vec<&str> =
-            results.hits.iter().map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap()).collect();
+        let order: Vec<String> = results
+            .hits
+            .iter()
+            .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+            .collect();
         assert_eq!(order, ["2", "1", "3"]);
         assert_eq!(results.hits[0].info.filters, 1);
         assert_eq!(results.nb_hits, 3);
@@ -835,7 +838,7 @@ mod highlight_shortcut_tests {
             for hit in &results.hits {
                 let record = index.store().get(hit.doc).unwrap();
                 let attributes = params.attributes_to_highlight.as_ref().unwrap();
-                let full = highlight::highlight(record, attributes, &matcher, &HighlightTags::default(), |_| true);
+                let full = highlight::highlight(&record, attributes, &matcher, &HighlightTags::default(), |_| true);
                 assert_eq!(hit.highlight, full, "query {query:?} record {}", record["objectID"]);
             }
         }

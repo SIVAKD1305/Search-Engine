@@ -151,9 +151,9 @@ impl<'a> Signals<'a> {
             // group of thousands of words costs one set.
             for p in &term.prefixes {
                 if !no_typos && let Some(docs) = index.prefix_docs(&p.prefix) {
-                    by_typos[usize::from(p.typos).min(2)] |= docs;
+                    by_typos[usize::from(p.typos).min(2)] |= docs.as_ref();
                 }
-                add_attributes(index.prefix_docs_by_attribute(&p.prefix));
+                add_attributes(&index.prefix_docs_by_attribute(&p.prefix));
             }
             for m in &term.matches {
                 let Some(postings) = index.word(&m.word) else { continue };

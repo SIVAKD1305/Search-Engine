@@ -80,7 +80,7 @@ fn resolve(index: &Index, ops: Vec<Op>) -> Vec<Entry> {
                 let current = match pending.get(&id) {
                     Some(record) => record.clone(),
                     None if cleared => None,
-                    None => index.get_object(&id).cloned(),
+                    None => index.get_object(&id),
                 };
                 let mut record = match current {
                     Some(record) => record,

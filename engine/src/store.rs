@@ -4,6 +4,10 @@
 //! dense `DocId` (u32), because posting lists and bitmaps are far smaller and
 //! faster with small integers. Ids of deleted records are not reused, so a
 //! `DocId` never silently points at a different record.
+//!
+//! Records are kept as compact JSON text and parsed when read. A parsed
+//! JSON tree takes about five times the memory of its text, and searches
+//! read only the records of the page they return.
 
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -33,11 +37,25 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// What `upsert` did.
+#[derive(Debug)]
+pub struct Upserted {
+    pub id: DocId,
+    /// The record as stored (objectID normalized to a string).
+    pub record: Map<String, Value>,
+    /// The record it replaced, if any.
+    pub previous: Option<Map<String, Value>>,
+}
+
 #[derive(Default)]
 pub struct DocumentStore {
-    /// Indexed by DocId; `None` marks a deleted record.
-    docs: Vec<Option<Map<String, Value>>>,
+    /// Compact JSON per DocId; `None` marks a deleted record.
+    docs: Vec<Option<Box<str>>>,
     ids: HashMap<String, DocId>,
+}
+
+fn parse(text: &str) -> Map<String, Value> {
+    serde_json::from_str(text).expect("stored records are valid JSON objects")
 }
 
 impl DocumentStore {
@@ -46,8 +64,7 @@ impl DocumentStore {
     }
 
     /// Inserts a record, or replaces the record with the same objectID.
-    /// Returns its DocId and the previous version, if any.
-    pub fn upsert(&mut self, record: Value) -> Result<(DocId, Option<Map<String, Value>>), StoreError> {
+    pub fn upsert(&mut self, record: Value) -> Result<Upserted, StoreError> {
         let Value::Object(mut map) = record else {
             return Err(StoreError::NotAnObject);
         };
@@ -58,25 +75,32 @@ impl DocumentStore {
         };
         // Store the objectID normalized as a string, as Algolia returns it.
         map.insert("objectID".into(), Value::String(object_id.clone()));
+        let text: Box<str> = serde_json::to_string(&map).expect("JSON values serialize").into();
 
         if let Some(&id) = self.ids.get(&object_id) {
-            let previous = self.docs[id as usize].replace(map);
-            return Ok((id, previous));
+            let previous = self.docs[id as usize].replace(text).map(|old| parse(&old));
+            return Ok(Upserted { id, record: map, previous });
         }
         let id = DocId::try_from(self.docs.len()).expect("more than u32::MAX records");
-        self.docs.push(Some(map));
+        self.docs.push(Some(text));
         self.ids.insert(object_id, id);
-        Ok((id, None))
+        Ok(Upserted { id, record: map, previous: None })
     }
 
     pub fn delete(&mut self, object_id: &str) -> Option<(DocId, Map<String, Value>)> {
         let id = self.ids.remove(object_id)?;
-        let doc = self.docs[id as usize].take()?;
-        Some((id, doc))
+        let text = self.docs[id as usize].take()?;
+        Some((id, parse(&text)))
     }
 
-    pub fn get(&self, id: DocId) -> Option<&Map<String, Value>> {
-        self.docs.get(id as usize)?.as_ref()
+    /// The record, parsed.
+    pub fn get(&self, id: DocId) -> Option<Map<String, Value>> {
+        self.get_raw(id).map(parse)
+    }
+
+    /// The record as stored: compact JSON.
+    pub fn get_raw(&self, id: DocId) -> Option<&str> {
+        self.docs.get(id as usize)?.as_deref()
     }
 
     pub fn id_of(&self, object_id: &str) -> Option<DocId> {
@@ -92,11 +116,14 @@ impl DocumentStore {
         self.ids.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (DocId, &Map<String, Value>)> {
-        self.docs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, d)| d.as_ref().map(|d| (i as DocId, d)))
+    /// Live records, parsed.
+    pub fn iter(&self) -> impl Iterator<Item = (DocId, Map<String, Value>)> + '_ {
+        self.iter_raw().map(|(id, text)| (id, parse(text)))
+    }
+
+    /// Live records as stored (compact JSON), in DocId order.
+    pub fn iter_raw(&self) -> impl Iterator<Item = (DocId, &str)> + '_ {
+        self.docs.iter().enumerate().filter_map(|(i, d)| d.as_deref().map(|d| (i as DocId, d)))
     }
 
     /// Loads JSON Lines (one record per line). Blank lines are skipped.
@@ -124,16 +151,18 @@ mod tests {
     #[test]
     fn upsert_assigns_dense_ids_and_replaces_by_object_id() {
         let mut store = DocumentStore::new();
-        let (a, prev) = store.upsert(json!({"objectID": "x", "v": 1})).unwrap();
-        assert_eq!((a, prev), (0, None));
-        let (b, _) = store.upsert(json!({"objectID": 7, "v": 2})).unwrap();
-        assert_eq!(b, 1);
+        let first = store.upsert(json!({"objectID": "x", "v": 1})).unwrap();
+        assert_eq!((first.id, first.previous), (0, None));
+        let second = store.upsert(json!({"objectID": 7, "v": 2})).unwrap();
+        assert_eq!(second.id, 1);
+        assert_eq!(second.record["objectID"], "7");
         assert_eq!(store.id_of("7"), Some(1));
 
-        let (again, prev) = store.upsert(json!({"objectID": "x", "v": 3})).unwrap();
-        assert_eq!(again, 0);
-        assert_eq!(prev.unwrap()["v"], 1);
+        let again = store.upsert(json!({"objectID": "x", "v": 3})).unwrap();
+        assert_eq!(again.id, 0);
+        assert_eq!(again.previous.unwrap()["v"], 1);
         assert_eq!(store.get(0).unwrap()["v"], 3);
+        assert_eq!(store.get_raw(0), Some(r#"{"objectID":"x","v":3}"#));
         assert_eq!(store.len(), 2);
     }
 
@@ -143,8 +172,7 @@ mod tests {
         store.upsert(json!({"objectID": "a"})).unwrap();
         assert!(store.delete("a").is_some());
         assert!(store.get(0).is_none());
-        let (id, _) = store.upsert(json!({"objectID": "a"})).unwrap();
-        assert_eq!(id, 1);
+        assert_eq!(store.upsert(json!({"objectID": "a"})).unwrap().id, 1);
         assert_eq!(store.iter().map(|(id, _)| id).collect::<Vec<_>>(), vec![1]);
     }
 
