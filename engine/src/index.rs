@@ -16,6 +16,7 @@
 use crate::store::{DocId, DocumentStore, StoreError};
 use crate::tokenizer::{HanLanguage, Segmentation, tokenize_value};
 use crate::facets::{FacetAttribute, FacetCount, FacetIndex, FacetStats, NumericIndex};
+use crate::geo::GeoIndex;
 use crate::ranking::{CustomRule, Ranking};
 use crate::search::RemoveWords;
 use crate::synonyms::{self, Synonym};
@@ -164,6 +165,8 @@ pub struct Index {
     prefixes: FxHashMap<String, PrefixDocs>,
     facets: FacetIndex,
     numbers: NumericIndex,
+    /// Records' `_geoloc` points.
+    geo: GeoIndex,
     /// Ids of all live records.
     live: RoaringBitmap,
     /// Phrases and what they can stand for, from `settings.synonyms`.
@@ -182,7 +185,7 @@ pub struct Index {
 
 /// Changes whenever the layout of `Index` (or anything inside it) changes,
 /// so an old image is rejected instead of misread.
-const IMAGE_VERSION: u32 = 3;
+const IMAGE_VERSION: u32 = 4;
 
 /// Records with up to this many `customRanking` rules keep a sorted order.
 pub const MAX_ORDERED_RULES: usize = 4;
@@ -421,6 +424,10 @@ impl Index {
         self.facets.counts(attribute, candidates, limit)
     }
 
+    pub fn geo(&self) -> &GeoIndex {
+        &self.geo
+    }
+
     /// Records with a numeric `attribute` value inside the bounds.
     pub fn numeric_docs(&self, attribute: &str, low: Bound<f64>, high: Bound<f64>) -> RoaringBitmap {
         self.numbers.docs(attribute, low, high)
@@ -508,6 +515,7 @@ impl Index {
         }
         self.facets.add(id, doc);
         self.numbers.add(id, doc);
+        self.geo.add(id, doc);
         let mut hits: FxHashMap<String, Vec<Hit>> = FxHashMap::default();
         let segmentation = self.segmentation().with_parts();
         for (attribute, value) in self.searchable_fields(doc) {
@@ -583,6 +591,7 @@ impl Index {
         }
         self.facets.remove(id);
         self.numbers.remove(id, old);
+        self.geo.remove(id);
         // The record's word list says which words to remove it from.
         let old_words: FxHashSet<WordId> = self
             .occurrences

@@ -18,7 +18,8 @@ pub struct ResponseOptions {
     pub attributes_to_retrieve: Option<Vec<String>>,
 }
 
-const STRING_KEYS: &[&str] = &["query", "filters", "highlightPreTag", "highlightPostTag", "snippetEllipsisText"];
+const STRING_KEYS: &[&str] =
+    &["query", "filters", "highlightPreTag", "highlightPostTag", "snippetEllipsisText", "aroundLatLng"];
 const LIST_KEYS: &[&str] =
     &["facets", "optionalFilters", "optionalWords", "attributesToHighlight", "attributesToSnippet", "attributesToRetrieve"];
 

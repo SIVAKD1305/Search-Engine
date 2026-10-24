@@ -71,7 +71,19 @@
    whose filters are applied as separate conditions so a request cannot
    lift them; sliding-window rate limits per key and IP (or userToken), and
    per IP for unknown keys; `server secured-key` to make secured keys.
-8. Geo search, facet stats, multi-word synonyms
+8. ✅ Geo search, facet stats, multi-word synonyms:
+   - `_geoloc` (one point or several), `aroundLatLng` with `aroundRadius`
+     (meters, `"all"`, or automatic: the 1,000 nearest matching records),
+     `aroundPrecision`, `minimumAroundRadius`, `insideBoundingBox`,
+     `insidePolygon`; the `geo` criterion (after `typo`, as in Algolia),
+     `geoDistance` and `matchedGeoLocation` in `_rankingInfo`. Points are in
+     a grid of 0.25° cells, and the nearest records are found by searching
+     rings of cells outward (100k records in 50 clusters: mean 2.1 ms,
+     p99 8.3 ms with a point in every query).
+   - `facets_stats` (min, max, avg, sum) for numeric facets.
+   - Synonym entries of up to 5 words: a word matches a phrase of adjacent
+     words, and query words forming an entry match its alternatives;
+     Chinese/Japanese entries work however they are split.
 
 ## Next
 
@@ -112,16 +124,24 @@
 - Load test: 2,000 searches with 16 parallel `curl` processes on 4 cores
   gave p50 4.6 ms, p99 27.6 ms, 315 req/s, all 200s. The client (one process
   per request) was the bottleneck; measure again with a real load generator.
-- Query understanding not yet done: multi-word synonyms ("new york" = "ny"),
-  `altCorrection` synonyms and placeholders, Algolia's separate
+- Query understanding not yet done: `altCorrection` synonyms and
+  placeholders, Algolia's separate
   `/synonyms` API (here synonyms are a setting), plurals and stop words for
   languages other than English (`queryLanguages`), and splitting or joining
   words ("head phones" = "headphones").
 - Facet counts on very large results (30k+ hits over 2,000 brands) take
   5–9 ms; Algolia approximates counts there (`exhaustiveFacetsCount: false`).
-- Facets not yet done: `facets_stats` (min/max/avg of numeric facets),
-  searching inside facet values (`searchForFacetValues`), nested attributes
-  (`brand.name`), and geo filters (`aroundLatLng`, the `geo` criterion).
+- Facets not yet done: searching inside facet values
+  (`searchForFacetValues`) and nested attributes (`brand.name`).
+- Geo gaps: boxes and polygons must not cross the 180th meridian;
+  `aroundPrecision` as a list of ranges, `aroundLatLngViaIP` and
+  `aroundRadius` per query language are not supported; the automatic
+  radius counts the nearest 1,000 matching records rather than Algolia's
+  density estimate; when a query matches most of a large index, choosing
+  the automatic radius measures every match (about 6 ms at 100k).
+- Synonym gaps: a synonym applies only to whole query words (not to the
+  word being typed, unless it is complete); a query phrase matched through
+  its words anywhere also counts its words as one query term for ranking.
 
 - Chinese/Japanese gaps: a query starting in the middle of a word finds
   nothing (as in English: "eadphones"); multi-word synonyms are needed for

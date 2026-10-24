@@ -609,3 +609,35 @@ async fn numeric_facets_have_stats() {
     let response = client.search("products", json!({"query": "", "facets": ["brand"]})).await;
     assert!(response.get("facets_stats").is_none());
 }
+
+#[tokio::test]
+async fn geo_search_over_http() {
+    let client = Client::new();
+    client
+        .admin(
+            Method::POST,
+            "/1/indexes/places/batch",
+            Some(json!({"requests": [
+                {"action": "addObject", "body": {"objectID": "paris", "name": "Paris", "_geoloc": {"lat": 48.8566, "lng": 2.3522}}},
+                {"action": "addObject", "body": {"objectID": "london", "name": "London", "_geoloc": {"lat": 51.5074, "lng": -0.1278}}},
+                {"action": "addObject", "body": {"objectID": "nyc", "name": "New York", "_geoloc": [{"lat": 40.7128, "lng": -74.006}]}}
+            ]})),
+        )
+        .await;
+    let response =
+        client.search("places", json!({"params": "aroundLatLng=51.5%2C-0.12&aroundRadius=1000000&getRankingInfo=true"})).await;
+    assert_eq!(ids(&response), ["london", "paris"]);
+    assert_eq!(response["aroundLatLng"], "51.5,-0.12");
+    let info = &response["hits"][1]["_rankingInfo"];
+    assert!(info["geoDistance"].as_u64().unwrap() > 300_000);
+    assert_eq!(info["matchedGeoLocation"]["lat"], 48.8566);
+    // Automatic radius: every located record here.
+    let response = client.search("places", json!({"aroundLatLng": "48.8566, 2.3522"})).await;
+    assert_eq!(ids(&response), ["paris", "london", "nyc"]);
+    assert!(response["automaticRadius"].as_str().unwrap().parse::<u64>().unwrap() > 5_000_000);
+    let response = client.search("places", json!({"insideBoundingBox": [[60, -10, 35, 30]]})).await;
+    assert_eq!(ids(&response).len(), 2);
+    let (status, _) =
+        client.call(Method::POST, "/1/indexes/places/query", Some(SEARCH), Some(json!({"aroundLatLng": "nowhere"}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

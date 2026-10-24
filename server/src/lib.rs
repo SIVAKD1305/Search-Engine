@@ -286,6 +286,13 @@ fn run_search(index: &Index, params: &SearchParams, options: &ResponseOptions) -
     if let Some(query) = &results.query_after_removal {
         response["queryAfterRemoval"] = json!(query);
     }
+    if let Some(center) = &results.around_lat_lng {
+        response["aroundLatLng"] = json!(format!("{},{}", center.lat, center.lng));
+    }
+    if let Some(radius) = results.automatic_radius {
+        // A string in Algolia's responses.
+        response["automaticRadius"] = json!(radius.to_string());
+    }
     Ok(response)
 }
 

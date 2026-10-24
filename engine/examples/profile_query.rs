@@ -33,7 +33,7 @@ fn main() {
             candidates.len(),
             time(10, || plan(&index, q)),
             time(10, || matching(&index, &terms)),
-            time(10, || rank_page(&index, &terms, &candidates, &[], 0, 20)),
+            time(10, || rank_page(&index, &terms, &candidates, &[], None, 0, 20)),
             time(10, || search(&index, &no_highlight).unwrap()),
             time(10, || search(&index, &SearchParams::new(q.as_str())).unwrap()),
         );

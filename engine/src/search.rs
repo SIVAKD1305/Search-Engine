@@ -10,6 +10,7 @@
 
 use crate::facets::{FacetCount, FacetStats};
 use crate::filter::{self, FilterError};
+use crate::geo::{self, GeoPoint, GeoQuery, Radius};
 use crate::highlight::{self, HighlightTags, Matcher};
 use crate::index::{Index, Settings};
 use crate::language::{is_stop_word, plural_forms};
@@ -380,6 +381,19 @@ pub struct SearchParams {
     /// A list, or one string of words separated by spaces or commas.
     #[serde(deserialize_with = "words_list")]
     pub optional_words: Option<Vec<String>>,
+    /// `"lat, lng"`: rank by distance from this point, and keep only records
+    /// near it (see `geo`).
+    pub around_lat_lng: Option<String>,
+    /// Meters, or `"all"`; chosen automatically when missing.
+    pub around_radius: Option<Value>,
+    /// Distances are ranked in steps of this many meters.
+    pub around_precision: Option<f64>,
+    /// Smallest automatic radius, in meters.
+    pub minimum_around_radius: Option<f64>,
+    /// Areas `[lat1, lng1, lat2, lng2]` (two opposite corners).
+    pub inside_bounding_box: Option<Value>,
+    /// Areas `[lat1, lng1, lat2, lng2, lat3, lng3, ...]`.
+    pub inside_polygon: Option<Value>,
 }
 
 fn words_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
@@ -416,8 +430,41 @@ impl Default for SearchParams {
             synonyms: None,
             remove_words_if_no_results: None,
             optional_words: None,
+            around_lat_lng: None,
+            around_radius: None,
+            around_precision: None,
+            minimum_around_radius: None,
+            inside_bounding_box: None,
+            inside_polygon: None,
         }
     }
+}
+
+/// The geo part of the request, if it has one.
+fn geo_query(params: &SearchParams) -> Result<Option<GeoQuery>, FilterError> {
+    let error = |e: String| FilterError(e);
+    let center = params.around_lat_lng.as_deref().map(geo::parse_point).transpose().map_err(error)?;
+    let radius = match &params.around_radius {
+        None | Some(Value::Null) => Radius::Automatic,
+        Some(Value::String(s)) if s == "all" => Radius::All,
+        Some(v) => match v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())) {
+            Some(m) if m >= 0.0 => Radius::Meters(m),
+            _ => return Err(error(format!("aroundRadius must be meters or \"all\", got {v}"))),
+        },
+    };
+    let areas = |value: &Option<Value>, name: &str, size: usize, exact: bool| match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(v) => geo::parse_areas(v, name, size, exact).map_err(error),
+    };
+    let query = GeoQuery {
+        center,
+        precision: params.around_precision.filter(|p| *p > 0.0).unwrap_or(geo::DEFAULT_PRECISION),
+        radius,
+        minimum_radius: params.minimum_around_radius.unwrap_or(0.0).max(0.0),
+        boxes: areas(&params.inside_bounding_box, "insideBoundingBox", 4, true)?,
+        polygons: areas(&params.inside_polygon, "insidePolygon", 6, false)?,
+    };
+    Ok((!query.is_empty()).then_some(query))
 }
 
 impl SearchParams {
@@ -454,6 +501,10 @@ pub struct SearchResults {
     /// Set when words were removed: the query with removed words wrapped
     /// in the highlight tags (Algolia's `queryAfterRemoval`).
     pub query_after_removal: Option<String>,
+    /// The `aroundLatLng` point used.
+    pub around_lat_lng: Option<GeoPoint>,
+    /// The radius chosen when none was given, in meters.
+    pub automatic_radius: Option<u64>,
 }
 
 /// Runs a query and returns one page (0-based) of ranked results.
@@ -461,14 +512,12 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
     let hits_per_page = params.hits_per_page.max(1);
     let options = QueryOptions::for_request(index.settings(), params);
     let mut terms = plan_with(index, &params.query, &options);
-    let mut filtered: Option<RoaringBitmap> = None;
+    let geo = geo_query(params)?;
+    let mut restrictions: Vec<RoaringBitmap> = geo.iter().filter_map(|g| g.restriction(index.geo())).collect();
     for filters in params.filters.iter().chain(&params.enforced_filters).filter(|f| !f.trim().is_empty()) {
-        let docs = filter::parse(filters)?.evaluate(index)?;
-        filtered = Some(match filtered {
-            Some(f) => f & docs,
-            None => docs,
-        });
+        restrictions.push(filter::parse(filters)?.evaluate(index)?);
     }
+    let filtered = restrictions.into_iter().reduce(|a, b| a & b);
     let apply_filters = |mut docs: RoaringBitmap| {
         if let Some(f) = &filtered {
             docs &= f;
@@ -501,6 +550,14 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
                 }
             }
         }
+    }
+    let mut automatic_radius = None;
+    if let Some(g) = &geo
+        && let Some(center) = g.automatic()
+    {
+        let (radius, within) = index.geo().automatic_radius(&center, &candidates, g.minimum_radius);
+        candidates = within;
+        automatic_radius = Some(radius.round() as u64);
     }
     let query_after_removal = (!removed.is_empty()).then(|| {
         tokenize_with(&params.query, index.segmentation())
@@ -540,7 +597,7 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
 
     let nb_hits = candidates.len();
     let offset = params.page.saturating_mul(hits_per_page);
-    let page = rank_page(index, &terms, &candidates, &boosts, offset, hits_per_page).into_iter();
+    let page = rank_page(index, &terms, &candidates, &boosts, geo.as_ref(), offset, hits_per_page).into_iter();
 
     let matcher = Matcher::new(&terms, index.segmentation());
     // Which attributes of a record hold a matched word, from the record's
@@ -590,6 +647,8 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
         facets_stats,
         terms,
         query_after_removal,
+        around_lat_lng: geo.as_ref().and_then(|g| g.center),
+        automatic_radius,
     })
 }
 
@@ -1263,5 +1322,111 @@ mod synonym_tests {
         let results = search(&index, &SearchParams::new("ny pizza")).unwrap();
         let first = results.hits.iter().find(|h| index.store().get(h.doc).unwrap()["objectID"] == "1").unwrap();
         assert_eq!(first.highlight["name"]["value"], "<em>New</em> <em>York</em> <em>pizza</em>");
+    }
+}
+
+#[cfg(test)]
+mod geo_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cities() -> Index {
+        let settings = json!({"searchableAttributes": ["name"], "customRanking": ["desc(rating)"]});
+        let mut index = Index::new(serde_json::from_value(settings).unwrap());
+        for (id, name, place, rating) in [
+            (1, "Paris", Some((48.8566, 2.3522)), 3),
+            (2, "Versailles", Some((48.8049, 2.1204)), 5),
+            (3, "London", Some((51.5074, -0.1278)), 4),
+            (4, "Berlin", Some((52.52, 13.405)), 2),
+            (5, "New York", Some((40.7128, -74.006)), 5),
+            (6, "Online shop", None, 5),
+        ] {
+            let mut record = json!({"objectID": id.to_string(), "name": name, "rating": rating});
+            if let Some((lat, lng)) = place {
+                record["_geoloc"] = json!({"lat": lat, "lng": lng});
+            }
+            index.add(record).unwrap();
+        }
+        index
+    }
+
+    fn run(index: &Index, params: Value) -> SearchResults {
+        let params: SearchParams = serde_json::from_value(params).unwrap();
+        search(index, &params).unwrap()
+    }
+
+    fn ids(index: &Index, params: Value) -> Vec<String> {
+        run(index, params)
+            .hits
+            .iter()
+            .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn around_a_point_nearest_first_within_the_radius() {
+        let index = cities();
+        let paris = "48.8566, 2.3522";
+        assert_eq!(ids(&index, json!({"aroundLatLng": paris, "aroundRadius": 500_000})), ["1", "2", "3"]);
+        // In 100 km steps Paris and Versailles tie, and the rating decides.
+        let coarse = json!({"aroundLatLng": paris, "aroundRadius": 500_000, "aroundPrecision": 100_000});
+        assert_eq!(ids(&index, coarse), ["2", "1", "3"]);
+        let results = run(&index, json!({"aroundLatLng": paris, "aroundRadius": 500_000}));
+        let versailles = &results.hits[1].info;
+        assert!((16_000..19_000).contains(&versailles.geo_distance.unwrap()), "{versailles:?}");
+        assert_eq!(versailles.matched_geo_location.unwrap().lat, 48.8049);
+        assert_eq!(versailles.geo_precision, Some(10));
+    }
+
+    #[test]
+    fn the_automatic_radius_and_all() {
+        let index = cities();
+        // Fewer than 1,000 located records: all of them, but not the unlocated one.
+        let results = run(&index, json!({"aroundLatLng": "48.8566, 2.3522"}));
+        assert_eq!(results.nb_hits, 5);
+        let new_york = results.hits.last().unwrap().info.geo_distance.unwrap();
+        assert_eq!(results.automatic_radius, Some(new_york));
+        assert_eq!(ids(&index, json!({"aroundLatLng": "48.8566, 2.3522", "aroundRadius": "all"})), ["1", "2", "3", "4", "5", "6"]);
+        let floor = json!({"aroundLatLng": "48.8566, 2.3522", "query": "paris", "minimumAroundRadius": 10_000_000});
+        assert_eq!(run(&index, floor).automatic_radius, Some(10_000_000));
+    }
+
+    #[test]
+    fn boxes_and_polygons() {
+        let index = cities();
+        let europe = json!([[60, -10, 35, 30]]);
+        // Without aroundLatLng, the box filters and the rating ranks.
+        assert_eq!(ids(&index, json!({"insideBoundingBox": europe})), ["2", "3", "1", "4"]);
+        // With it, the box replaces the radius and distance ranks.
+        assert_eq!(ids(&index, json!({"insideBoundingBox": europe, "aroundLatLng": "52.52, 13.405"})), ["4", "1", "2", "3"]);
+        assert_eq!(ids(&index, json!({"insideBoundingBox": "60,-10,35,30"})).len(), 4);
+        let around_paris = json!([[49.2, 2.2, 48.5, 1.8, 48.5, 2.8]]);
+        assert_eq!(ids(&index, json!({"insidePolygon": around_paris})), ["2", "1"]);
+        // Several areas: records in any of them.
+        let two = json!([[49.2, 2.2, 48.5, 1.8, 48.5, 2.8], [41, -75, 40, -73, 42, -73]]);
+        assert_eq!(ids(&index, json!({"insidePolygon": two})), ["2", "5", "1"]);
+    }
+
+    #[test]
+    fn geo_works_with_text_and_filters() {
+        let index = cities();
+        let params = json!({"query": "paris", "aroundLatLng": "51.5, -0.12", "aroundRadius": 1_000_000});
+        assert_eq!(ids(&index, params), ["1"]);
+        let params = json!({"filters": "rating >= 4", "aroundLatLng": "48.8566, 2.3522", "aroundRadius": 1_000_000});
+        assert_eq!(ids(&index, params), ["2", "3"]);
+    }
+
+    #[test]
+    fn bad_geo_parameters_are_errors() {
+        let index = cities();
+        for params in [
+            json!({"aroundLatLng": "paris"}),
+            json!({"aroundLatLng": "48.8, 2.3", "aroundRadius": "far"}),
+            json!({"insideBoundingBox": [[1, 2, 3]]}),
+            json!({"insidePolygon": [[1, 2, 3, 4]]}),
+        ] {
+            let p: SearchParams = serde_json::from_value(params.clone()).unwrap();
+            assert!(search(&index, &p).is_err(), "{params}");
+        }
     }
 }

@@ -38,6 +38,21 @@ Data is saved in `./search-data` (change with `--data-dir DIR`, or use
 write-ahead log on disk before the server answers, so it survives a crash.
 `--load` replaces an index with the records of a JSONL file.
 
+## Geo search, facet stats and synonyms
+
+Records with `_geoloc` (`{"lat": 48.85, "lng": 2.35}`, or a list) can be
+searched around a point, inside boxes or polygons, and ranked by distance:
+
+```bash
+curl -H 'X-Algolia-API-Key: my-search' -X POST \
+  http://127.0.0.1:8080/1/indexes/shops/query \
+  -d '{"query": "pizza", "aroundLatLng": "48.85, 2.35", "aroundRadius": 5000}'
+```
+
+Without `aroundRadius` the radius is chosen to cover the 1,000 nearest
+matches. Numeric facets get `facets_stats` (min, max, avg, sum). Synonyms
+may be phrases: `{"type": "synonym", "synonyms": ["ny", "new york"]}`.
+
 ## API keys
 
 The admin key can do everything; the search key can search. More keys,

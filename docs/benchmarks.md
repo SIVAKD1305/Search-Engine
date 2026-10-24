@@ -78,6 +78,24 @@ The slowest queries at 1M are all facet counts over 150k-220k hits
 (`brand` and `category` together, 45-70 ms). Approximate counts on very
 large results, as Algolia does, are the next fix there.
 
+## Geo search (item 8)
+
+The 100k catalog with a `_geoloc` for every record, around 50 random
+cities (spread about 30 km), and the same 5,000 queries, each with an
+`aroundLatLng` near a city: half with `aroundRadius: 50000`, half with the
+automatic radius.
+
+| | Mean | p50 | p99 |
+|---|---|---|---|
+| Without geo | 1.77 ms | 1.61 ms | 5.53 ms |
+| Radius 50 km | 1.85 ms | 1.80 ms | 4.43 ms |
+| Automatic radius | 2.11 ms | 1.71 ms | 10.08 ms |
+| Automatic, measuring every match (first version) | 15.65 ms | 15.21 ms | 28.57 ms |
+
+The first version measured every matching record's distance up to three
+times. Now the nearest records are found by searching rings of grid cells
+outward from the point, until nothing outside can be nearer.
+
 ## Chinese and Japanese (item 6)
 
 50,000 generated product records per language: names and descriptions made

@@ -4,6 +4,7 @@
 pub mod bucket;
 pub mod facets;
 pub mod filter;
+pub mod geo;
 pub mod highlight;
 pub mod index;
 pub mod language;

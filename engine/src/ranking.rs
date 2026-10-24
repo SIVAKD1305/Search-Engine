@@ -5,6 +5,7 @@
 //! broken by the second, and so on. Default order:
 //!
 //! 1. `typo`      — fewer typos first
+//!    `geo`       — nearer to `aroundLatLng` first (in `aroundPrecision` steps)
 //! 2. `words`     — more query words matched first
 //!    `filters`   — more `optionalFilters` matched first
 //! 3. `proximity` — query words closer together first
@@ -12,6 +13,7 @@
 //! 5. `exact`     — more words matched exactly (whole word, no typo) first
 //! 6. `custom`    — the index's own business metrics, e.g. `desc(rating)`
 
+use crate::geo::{GeoPoint, GeoQuery};
 use crate::index::{AttributeId, Hit, Index, WordId};
 use crate::search::QueryTerm;
 use crate::store::DocId;
@@ -27,6 +29,7 @@ pub const MAX_PROXIMITY: u32 = 8;
 #[serde(rename_all = "lowercase")]
 pub enum Criterion {
     Typo,
+    Geo,
     Words,
     Filters,
     Proximity,
@@ -42,7 +45,7 @@ pub struct Ranking(pub Vec<Criterion>);
 impl Default for Ranking {
     fn default() -> Self {
         use Criterion::*;
-        Ranking(vec![Typo, Words, Filters, Proximity, Attribute, Exact, Custom])
+        Ranking(vec![Typo, Geo, Words, Filters, Proximity, Attribute, Exact, Custom])
     }
 }
 
@@ -95,6 +98,24 @@ pub struct RankingInfo {
     pub nb_exact_words: u32,
     /// Values of the `customRanking` attributes, in rule order.
     pub custom: Vec<Option<f64>>,
+    /// Meters from `aroundLatLng` to the record's nearest point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geo_distance: Option<u64>,
+    /// The `aroundPrecision` the distance is ranked with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geo_precision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_geo_location: Option<MatchedGeoLocation>,
+    /// Ranking key from the distance (not part of `_rankingInfo`).
+    #[serde(skip)]
+    pub geo_step: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct MatchedGeoLocation {
+    pub lat: f64,
+    pub lng: f64,
+    pub distance: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,7 +179,14 @@ impl TermWords {
 
 /// Sorts `candidates` by the index's ranking criteria. `boosts` are the
 /// record sets of the query's optional filters.
-pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boosts: &[RoaringBitmap]) -> Vec<RankedDoc> {
+/// `geo` ranks by distance from its `aroundLatLng`.
+pub fn rank(
+    index: &Index,
+    terms: &[QueryTerm],
+    candidates: &RoaringBitmap,
+    boosts: &[RoaringBitmap],
+    geo: Option<&GeoQuery>,
+) -> Vec<RankedDoc> {
     let docs: Vec<DocId> = candidates.iter().collect();
     let n_terms = terms.len();
     let mut cells: Vec<TermInDoc> = vec![TermInDoc::default(); docs.len() * n_terms];
@@ -188,6 +216,11 @@ pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boos
             }
             let mut info = ranking_info(row, index, doc, settings.custom_ranking.len());
             info.filters = boosts.iter().filter(|b| b.contains(doc)).count() as u32;
+            if let Some(g) = geo
+                && let Some(center) = g.center
+            {
+                set_geo(&mut info, index, doc, &center, g);
+            }
             RankedDoc { doc, info }
         })
         .collect();
@@ -204,6 +237,16 @@ pub fn rank(index: &Index, terms: &[QueryTerm], candidates: &RoaringBitmap, boos
     ranked
 }
 
+fn set_geo(info: &mut RankingInfo, index: &Index, doc: DocId, center: &GeoPoint, geo: &GeoQuery) {
+    info.geo_precision = Some(geo.precision as u64);
+    if let Some((distance, point)) = index.geo().nearest(doc, center) {
+        let meters = distance.round() as u64;
+        info.geo_distance = Some(meters);
+        info.geo_step = Some(geo.step(distance));
+        info.matched_geo_location = Some(MatchedGeoLocation { lat: point.lat, lng: point.lng, distance: meters });
+    }
+}
+
 fn ranking_info(row: &[TermInDoc], index: &Index, doc: DocId, custom_rules: usize) -> RankingInfo {
     let proximity_distance = row
         .windows(2)
@@ -217,6 +260,7 @@ fn ranking_info(row: &[TermInDoc], index: &Index, doc: DocId, custom_rules: usiz
         first_matched_attribute: row.iter().flat_map(|c| &c.hits).map(|h| h.attribute).min(),
         nb_exact_words: row.iter().filter(|c| c.exact).count() as u32,
         custom: (0..custom_rules).map(|rule| index.custom_value(rule, doc)).collect(),
+        ..RankingInfo::default()
     }
 }
 
@@ -248,6 +292,8 @@ pub(crate) fn pair_proximity(first: &[Hit], second: &[Hit]) -> u32 {
 fn compare(criterion: Criterion, a: &RankingInfo, b: &RankingInfo, custom: &[CustomRule]) -> Ordering {
     match criterion {
         Criterion::Typo => a.nb_typos.cmp(&b.nb_typos),
+        // Records without a location come last.
+        Criterion::Geo => missing_last(a.geo_step, b.geo_step, |x, y| x.cmp(&y)),
         Criterion::Words => b.words.cmp(&a.words),
         Criterion::Filters => b.filters.cmp(&a.filters),
         Criterion::Proximity => a.proximity_distance.cmp(&b.proximity_distance),

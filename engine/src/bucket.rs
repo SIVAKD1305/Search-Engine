@@ -14,6 +14,7 @@
 //! The records chosen for the page are then scored by `ranking::rank`, so
 //! the order and `_rankingInfo` are exactly those of the full ranking.
 
+use crate::geo::GeoQuery;
 use crate::index::{CustomKey, Hit, Index, MAX_ORDERED_RULES, ordered};
 use crate::ranking::{Criterion, RankedDoc, TermWords, pair_proximity, rank};
 use crate::search::QueryTerm;
@@ -28,6 +29,7 @@ pub fn rank_page(
     terms: &[QueryTerm],
     candidates: &RoaringBitmap,
     boosts: &[RoaringBitmap],
+    geo: Option<&GeoQuery>,
     offset: usize,
     len: usize,
 ) -> Vec<RankedDoc> {
@@ -35,7 +37,7 @@ pub fn rank_page(
     if len == 0 || offset >= candidates.len() as usize {
         return Vec::new();
     }
-    let mut signals = Signals::new(index, terms, boosts);
+    let mut signals = Signals::new(index, terms, boosts, geo);
     let mut groups: Vec<RoaringBitmap> = vec![candidates.clone()];
 
     for &criterion in &index.settings().ranking.0 {
@@ -69,7 +71,7 @@ pub fn rank_page(
     // Inside a group every criterion ties, so records go in DocId order.
     let page: RoaringBitmap = groups.iter().flat_map(|g| g.iter()).skip(offset).take(len).collect();
     // Scoring only the page's records gives the same order as the full ranking.
-    rank(index, terms, &page, boosts)
+    rank(index, terms, &page, boosts, geo)
 }
 
 /// Keeps leading subgroups until they hold at least `keep` records; the
@@ -114,6 +116,7 @@ struct Signals<'a> {
     index: &'a Index,
     terms: &'a [QueryTerm],
     boosts: &'a [RoaringBitmap],
+    geo: Option<&'a GeoQuery>,
     /// For each term, the records whose best match has 0, 1 and 2 typos
     /// (disjoint sets).
     typo_levels: Vec<[RoaringBitmap; 3]>,
@@ -128,7 +131,7 @@ struct Signals<'a> {
 }
 
 impl<'a> Signals<'a> {
-    fn new(index: &'a Index, terms: &'a [QueryTerm], boosts: &'a [RoaringBitmap]) -> Self {
+    fn new(index: &'a Index, terms: &'a [QueryTerm], boosts: &'a [RoaringBitmap], geo: Option<&'a GeoQuery>) -> Self {
         let mut typo_levels = Vec::with_capacity(terms.len());
         let mut exact_sets = Vec::with_capacity(terms.len());
         let mut attribute_sets: Vec<RoaringBitmap> = Vec::new();
@@ -175,7 +178,7 @@ impl<'a> Signals<'a> {
             exact_sets.push(exact);
         }
         let term_words = if terms.len() >= 2 { terms.iter().map(|t| TermWords::new(index, t)).collect() } else { Vec::new() };
-        Signals { index, terms, boosts, typo_levels, exact_sets, attribute_sets, term_words, proximity: HashMap::new() }
+        Signals { index, terms, boosts, geo, typo_levels, exact_sets, attribute_sets, term_words, proximity: HashMap::new() }
     }
 
     /// Computes proximity for the records of `group` not seen yet. Needs at
@@ -211,6 +214,7 @@ impl<'a> Signals<'a> {
             // Candidates match every required term.
             Criterion::Words => self.terms.iter().all(|t| !t.optional),
             Criterion::Filters => self.boosts.is_empty(),
+            Criterion::Geo => self.geo.is_none_or(|g| g.center.is_none()),
             Criterion::Proximity => self.terms.len() < 2,
             Criterion::Attribute | Criterion::Exact => self.terms.is_empty(),
             Criterion::Custom => self.index.settings().custom_ranking.is_empty(),
@@ -262,6 +266,35 @@ impl<'a> Signals<'a> {
                 }
                 subgroups.push(rest);
                 first_needed(subgroups, keep)
+            }
+            Criterion::Geo => {
+                let (index, geo) = (self.index, self.geo.expect("checked by ties_everything"));
+                let center = geo.center.expect("checked by ties_everything");
+                let located = group.intersection_len(index.geo().located());
+                if located <= keep as u64 {
+                    return to_bitmaps(by_key(group.iter().collect(), keep, |d| {
+                        index.geo().nearest(d, &center).map_or(u64::MAX, |(distance, _)| geo.step(distance))
+                    }));
+                }
+                // The nearest `keep`, and all tied with the last (same step).
+                let reach = |kth: f64| (geo.step(kth) + 1) as f64 * geo.precision.max(1.0) - 1e-9;
+                let found = index.geo().nearest_k(&center, &group, keep, reach);
+                let mut keyed: Vec<(u64, DocId)> = found.into_iter().map(|(d, doc)| (geo.step(d), doc)).collect();
+                keyed.sort_unstable();
+                let last_step = keyed.get(keep - 1).map(|k| k.0);
+                let mut subgroups: Vec<RoaringBitmap> = Vec::new();
+                let mut current: Option<u64> = None;
+                for (step, doc) in keyed {
+                    if last_step.is_some_and(|last| step > last) {
+                        break;
+                    }
+                    if current != Some(step) {
+                        subgroups.push(RoaringBitmap::new());
+                        current = Some(step);
+                    }
+                    subgroups.last_mut().expect("just pushed").insert(doc);
+                }
+                subgroups
             }
             Criterion::Proximity => {
                 self.gather(&group);
@@ -389,9 +422,13 @@ mod tests {
     }
 
     fn random_index(rng: &mut Lcg, settings: Settings) -> Index {
+        random_index_of(rng, settings, 400)
+    }
+
+    fn random_index_of(rng: &mut Lcg, settings: Settings, records: usize) -> Index {
         let words = ["wireless", "headphones", "kettle", "black", "lamp", "desk", "phone", "case", "head", "set"];
         let mut index = Index::new(settings);
-        for id in 0..400 {
+        for id in 0..records {
             let name: Vec<&str> = (0..1 + rng.next(4)).map(|_| words[rng.next(words.len())]).collect();
             let description: Vec<&str> = (0..rng.next(6)).map(|_| words[rng.next(words.len())]).collect();
             let brand = ["Orbix", "Elan", "Tundra"][rng.next(3)];
@@ -407,6 +444,11 @@ mod tests {
             }
             if rng.next(2) == 0 {
                 record["sales"] = json!(rng.next(3));
+            }
+            // Most records have a location; some share one.
+            if rng.next(6) > 0 {
+                let (lat, lng) = (45.0 + rng.next(20) as f64 * 0.05, 2.0 + rng.next(20) as f64 * 0.05);
+                record["_geoloc"] = json!({"lat": lat, "lng": lng});
             }
             index.add(record).unwrap();
         }
@@ -424,6 +466,8 @@ mod tests {
             json!(["typo", "words", "filters", "proximity", "attribute", "exact", "custom"]),
             json!(["custom", "typo", "proximity"]),
             json!(["exact", "attribute", "proximity", "words", "typo"]),
+            json!(["typo", "geo", "words", "filters", "proximity", "attribute", "exact", "custom"]),
+            json!(["geo", "custom"]),
         ] {
             let settings: Settings = serde_json::from_value(json!({
                 "searchableAttributes": ["name", "description"],
@@ -440,21 +484,63 @@ mod tests {
                         t.optional = all_optional;
                     }
                     let candidates = matching(&index, &terms);
-                    for boosts in [vec![], vec![index.facet_docs("brand", "Orbix")]] {
-                        let full = rank(&index, &terms, &candidates, &boosts);
+                    let near = |precision: f64| crate::geo::GeoQuery {
+                        center: Some(crate::geo::GeoPoint { lat: 45.5, lng: 2.5 }),
+                        precision,
+                        radius: crate::geo::Radius::All,
+                        minimum_radius: 0.0,
+                        boxes: Vec::new(),
+                        polygons: Vec::new(),
+                    };
+                    let geos = [None, Some(near(10.0)), Some(near(20_000.0))];
+                    for (boosts, geo) in [vec![], vec![index.facet_docs("brand", "Orbix")]]
+                        .into_iter()
+                        .flat_map(|b| geos.iter().map(move |g| (b.clone(), g.clone())))
+                    {
+                        let full = rank(&index, &terms, &candidates, &boosts, geo.as_ref());
                         for (offset, len) in [(0, 1), (0, 5), (0, 20), (3, 7), (20, 20), (390, 20), (0, 1000), (1000, 5)] {
-                            let page = rank_page(&index, &terms, &candidates, &boosts, offset, len);
+                            let page = rank_page(&index, &terms, &candidates, &boosts, geo.as_ref(), offset, len);
                             let expected: Vec<&RankedDoc> = full.iter().skip(offset).take(len).collect();
                             assert_eq!(
                                 page.iter().collect::<Vec<_>>(),
                                 expected,
-                                "query {query:?} optional {all_optional} boosts {} offset {offset} len {len} ranking {:?}",
+                                "query {query:?} optional {all_optional} boosts {} geo {geo:?} offset {offset} len {len} ranking {:?}",
                                 boosts.len(),
                                 index.settings().ranking
                             );
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn large_groups_rank_by_distance_like_the_full_ranking() {
+        let mut rng = Lcg(21);
+        let settings: Settings = serde_json::from_value(json!({
+            "searchableAttributes": ["name", "description"],
+            "customRanking": ["desc(rating)"],
+            "ranking": ["geo", "typo", "custom"],
+        }))
+        .unwrap();
+        let index = random_index_of(&mut rng, settings, 6000);
+        for (query, precision) in [("", 10.0), ("", 3_000.0), ("head", 10.0), ("w", 500.0)] {
+            let terms = plan_with(&index, query, &QueryOptions::from_settings(index.settings()));
+            let candidates = matching(&index, &terms);
+            let geo = crate::geo::GeoQuery {
+                center: Some(crate::geo::GeoPoint { lat: 45.3, lng: 2.6 }),
+                precision,
+                radius: crate::geo::Radius::All,
+                minimum_radius: 0.0,
+                boxes: Vec::new(),
+                polygons: Vec::new(),
+            };
+            let full = rank(&index, &terms, &candidates, &[], Some(&geo));
+            for (offset, len) in [(0, 20), (0, 1), (100, 50), (2500, 20), (5990, 20)] {
+                let page = rank_page(&index, &terms, &candidates, &[], Some(&geo), offset, len);
+                let expected: Vec<&RankedDoc> = full.iter().skip(offset).take(len).collect();
+                assert_eq!(page.iter().collect::<Vec<_>>(), expected, "{query:?} {precision} {offset}");
             }
         }
     }

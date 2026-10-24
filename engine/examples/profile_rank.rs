@@ -29,8 +29,8 @@ fn main() {
             "{q:>14}: plan {:.3}  match {:.3}  full rank {:.3}  page rank {:.3}  search {:.3} ms  ({} hits)",
             time(50, || plan(&index, q)),
             time(50, || matching(&index, &terms)),
-            time(50, || rank(&index, &terms, &cands, &[])),
-            time(50, || rank_page(&index, &terms, &cands, &[], 0, 20)),
+            time(50, || rank(&index, &terms, &cands, &[], None)),
+            time(50, || rank_page(&index, &terms, &cands, &[], None, 0, 20)),
             time(50, || search(&index, &SearchParams::new(q)).unwrap()),
             cands.len()
         );
