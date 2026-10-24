@@ -55,7 +55,14 @@
    13.0 -> 0.7 s, 16 concurrent writers 1,891 -> 5,068 writes/s. 1M catalog:
    indexing 506 -> 183 s, memory 8.1 -> 2.3 GB, p99 127 -> 33 ms, restart
    190 -> 11-14 s.
-6. Chinese/Japanese word segmentation
+6. ✅ Chinese/Japanese word segmentation: jieba (Chinese) and Lindera with
+   IPADIC (Japanese), chosen by script (kana means Japanese) and by
+   `indexLanguages`; dictionary words inside long words indexed as parts;
+   query fallbacks for half-typed words (joined back, or split into a word
+   and a prefix) and for words found only as parts; no typos for CJK words;
+   voicing marks kept and full-width forms folded. Typed queries (first 2-8
+   characters of a product name, 50k records each): 0/300 Japanese and 1/300
+   Chinese without results (12 and 11 before the fallbacks).
 7. Secured API keys and rate limiting
 8. Geo search, facet stats, multi-word synonyms
 
@@ -102,11 +109,14 @@
   searching inside facet values (`searchForFacetValues`), nested attributes
   (`brand.name`), and geo filters (`aroundLatLng`, the `geo` criterion).
 
-- **Proper Chinese/Japanese word splitting.** The tokenizer currently makes
-  each Han/Kana character its own token (`engine/src/tokenizer.rs`,
-  `is_unspaced_script`). Replace it with a dictionary-based segmenter such as
-  `lindera` (Japanese, also Chinese/Korean dictionaries) or `jieba-rs`
-  (Chinese). Korean is space-separated and already works at word level.
+- Chinese/Japanese gaps: a query starting in the middle of a word finds
+  nothing (as in English: "eadphones"); multi-word synonyms are needed for
+  CJK synonyms that split into several words ("笔记本电脑"); a Japanese index
+  must set `indexLanguages: ["ja"]` or kanji-only queries are split as
+  Chinese; Korean is split at spaces only, so particles stay attached
+  (서울에서 does not match 서울); traditional and simplified Chinese are not
+  mapped to each other; the Japanese dictionary is downloaded at build time
+  and adds about 50 MB to the binary.
 - Typo-tolerance timings in step 4 were measured with prices indexed (8,964
   words). With `config/products.json` the dictionary has 141 words, so
   re-measure on a large real vocabulary before trusting the speed.

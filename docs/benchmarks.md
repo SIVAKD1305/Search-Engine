@@ -78,6 +78,27 @@ The slowest queries at 1M are all facet counts over 150k-220k hits
 (`brand` and `category` together, 45-70 ms). Approximate counts on very
 large results, as Algolia does, are the next fix there.
 
+## Chinese and Japanese (item 6)
+
+50,000 generated product records per language: names and descriptions made
+of the 20,000 most common words of each dictionary (IPADIC nouns, jieba's
+word list), with Japanese particles and endings. Queries are the first 2-8
+characters of a random product name, so many end inside a word, as when
+typing.
+
+| | Japanese | Chinese |
+|---|---|---|
+| Indexing | 4.9 s (10,200 rec/s) | 2.5 s (20,000 rec/s) |
+| Memory | 97 MB | 111 MB |
+| Query mean / p99 | 0.82 / 15.4 ms | 0.99 / 18.2 ms |
+| Typed queries without results | 0 / 300 | 1 / 300 |
+
+The dictionaries cost memory only when used: about 3 MB for Japanese (read
+from the binary) and 33 MB for Chinese (jieba builds its word trie at first
+use, in about 0.1 s). The server binary grows from 42 to 111 MB, mostly the
+embedded Japanese dictionary. English results are unchanged (100k catalog:
+indexing 12.1 s, mean 1.70 ms, p99 5.06 ms).
+
 ## First measurements (October 2026)
 
 ### Scale, in-process (one core, 5,000 sampled queries)

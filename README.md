@@ -38,6 +38,30 @@ Data is saved in `./search-data` (change with `--data-dir DIR`, or use
 write-ahead log on disk before the server answers, so it survives a crash.
 `--load` replaces an index with the records of a JSONL file.
 
+## Chinese and Japanese
+
+Text without spaces is split into words with a dictionary: jieba for
+Chinese, Lindera with IPADIC for Japanese. Text containing kana is treated
+as Japanese; text in Han characters only is treated as Chinese unless the
+index is marked as Japanese, which a Japanese index should be, so that
+queries typed in kanji only are split the same way as the records:
+
+```bash
+curl -H 'X-Algolia-API-Key: my-admin' -X PUT \
+  http://127.0.0.1:8080/1/indexes/shop/settings -d '{"indexLanguages": ["ja"]}'
+```
+
+Long words are also indexed by their parts (関西国際空港 is found by 空港),
+half-typed words are matched as prefixes, and Chinese and Japanese words get
+no typo tolerance. Full-width letters match ASCII (Ｗｉｆｉ = wifi).
+
+The first build downloads the Japanese dictionary from lindera.dev (about
+50 MB, embedded in the binary). To build without network access, point
+`LINDERA_BUILD_DICTIONARY_CACHE_DIR` at a directory holding a previously
+built dictionary, or leave Japanese out with
+`cargo build --release -p server --no-default-features --features chinese`;
+without a dictionary each character is a word.
+
 ## Read replicas
 
 Start more servers that copy everything from a primary and serve searches:

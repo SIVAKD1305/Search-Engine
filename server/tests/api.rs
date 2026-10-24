@@ -341,3 +341,25 @@ async fn query_understanding_over_http() {
     assert_eq!(ids(&r), ["3"]);
     assert!(r.get("queryAfterRemoval").is_none());
 }
+
+#[cfg(feature = "japanese")]
+#[tokio::test]
+async fn japanese_index_over_http_and_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = Client::persistent(dir.path());
+    client
+        .admin(Method::PUT, "/1/indexes/shop/settings", Some(json!({"searchableAttributes": ["name"], "indexLanguages": ["ja"]})))
+        .await;
+    client.admin(Method::PUT, "/1/indexes/shop/1", Some(json!({"name": "関西国際空港限定トートバッグ"}))).await;
+    client.admin(Method::PUT, "/1/indexes/shop/2", Some(json!({"name": "電子辞書"}))).await;
+    let settings = client.admin(Method::GET, "/1/indexes/shop/settings", None).await;
+    assert_eq!(settings["indexLanguages"], json!(["ja"]));
+    drop(client);
+
+    let client = Client::persistent(dir.path());
+    let response = client.search("shop", json!({"query": "空港"})).await;
+    assert_eq!(ids(&response), ["1"]);
+    assert_eq!(response["hits"][0]["_highlightResult"]["name"]["value"], "関西国際<em>空港</em>限定トートバッグ");
+    // Kanji only, split as Japanese (電子 + 辞書) because of indexLanguages.
+    assert_eq!(ids(&client.search("shop", json!({"query": "辞書"})).await), ["2"]);
+}

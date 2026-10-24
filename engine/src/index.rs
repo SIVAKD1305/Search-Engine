@@ -14,7 +14,7 @@
 //!   matching word. Only record ids are kept here, as compressed bitmaps.
 
 use crate::store::{DocId, DocumentStore, StoreError};
-use crate::tokenizer::tokenize_value;
+use crate::tokenizer::{HanLanguage, Segmentation, tokenize_value};
 use crate::facets::{FacetAttribute, FacetCount, FacetIndex, NumericIndex};
 use crate::ranking::{CustomRule, Ranking};
 use crate::search::RemoveWords;
@@ -133,6 +133,9 @@ pub struct Settings {
     pub optional_words: Vec<String>,
     /// Algolia keeps synonyms in a separate API; here they are a setting.
     pub synonyms: Vec<Synonym>,
+    /// Languages of the records. With "ja" (and not "zh"), text written
+    /// only in kanji is split into words as Japanese instead of Chinese.
+    pub index_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +182,7 @@ pub struct Index {
 
 /// Changes whenever the layout of `Index` (or anything inside it) changes,
 /// so an old image is rejected instead of misread.
-const IMAGE_VERSION: u32 = 1;
+const IMAGE_VERSION: u32 = 2;
 
 /// Records with up to this many `customRanking` rules keep a sorted order.
 pub const MAX_ORDERED_RULES: usize = 4;
@@ -199,7 +202,7 @@ impl Index {
     pub fn new(settings: Settings) -> Self {
         let attributes = settings.searchable_attributes.clone().unwrap_or_default();
         let facets = FacetIndex::new(&settings.attributes_for_faceting);
-        let synonym_map = synonyms::build_map(&settings.synonyms);
+        let synonym_map = synonyms::build_map(&settings.synonyms, Segmentation { han: HanLanguage::from_languages(&settings.index_languages), parts: false });
         let custom_columns = vec![Vec::new(); settings.custom_ranking.len()];
         Index { settings, attributes, facets, synonym_map, custom_columns, ..Default::default() }
     }
@@ -210,6 +213,12 @@ impl Index {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// How this index splits Chinese and Japanese text into words; the same
+    /// for records and queries.
+    pub fn segmentation(&self) -> Segmentation {
+        Segmentation { han: HanLanguage::from_languages(&self.settings.index_languages), parts: false }
     }
 
     /// Words that `word` (normalized) can stand for.
@@ -299,7 +308,7 @@ impl Index {
             return Err(invalid(format!("image version {version}, expected {IMAGE_VERSION}")));
         }
         index.settings = serde_json::from_str(&settings).map_err(|e| invalid(e.to_string()))?;
-        index.synonym_map = synonyms::build_map(&index.settings.synonyms);
+        index.synonym_map = synonyms::build_map(&index.settings.synonyms, index.segmentation());
         index.word_ids = index.words.iter().map(|(w, &id)| (w.clone(), id)).collect();
         Ok(index)
     }
@@ -488,8 +497,9 @@ impl Index {
         self.facets.add(id, doc);
         self.numbers.add(id, doc);
         let mut hits: FxHashMap<String, Vec<Hit>> = FxHashMap::default();
+        let segmentation = self.segmentation().with_parts();
         for (attribute, value) in self.searchable_fields(doc) {
-            for token in tokenize_value(value) {
+            for token in tokenize_value(value, segmentation) {
                 hits.entry(token.text).or_default().push(Hit { attribute, position: token.position });
             }
         }

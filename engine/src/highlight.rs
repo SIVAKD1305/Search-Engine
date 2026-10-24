@@ -10,7 +10,7 @@
 //! The record text is HTML-escaped; only the highlight tags are raw HTML.
 
 use crate::search::QueryTerm;
-use crate::tokenizer::{Token, normalize, tokenize};
+use crate::tokenizer::{Segmentation, Token, group_parts, normalize, tokenize_with};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashMap};
 
@@ -44,10 +44,12 @@ pub struct Matcher<'a> {
     /// (prefix, hit) for prefix groups: a token starting with the prefix matches.
     prefixes: Vec<(&'a str, WordHit)>,
     terms: Vec<&'a str>,
+    /// How record text is split into words, as when it was indexed.
+    segmentation: Segmentation,
 }
 
 impl<'a> Matcher<'a> {
-    pub fn new(terms: &'a [QueryTerm]) -> Self {
+    pub fn new(terms: &'a [QueryTerm], segmentation: Segmentation) -> Self {
         let mut words: HashMap<&str, Vec<WordHit>> = HashMap::new();
         let mut prefixes = Vec::new();
         for (term, t) in terms.iter().enumerate() {
@@ -60,7 +62,12 @@ impl<'a> Matcher<'a> {
                 prefixes.push((p.prefix.as_str(), WordHit { term, marked_chars: Some(typed) }));
             }
         }
-        Matcher { words, prefixes, terms: terms.iter().map(|t| t.text.as_str()).collect() }
+        Matcher {
+            words,
+            prefixes,
+            terms: terms.iter().map(|t| t.text.as_str()).collect(),
+            segmentation: segmentation.with_parts(),
+        }
     }
 
     fn lookup(&self, token: &Token) -> Vec<WordHit> {
@@ -70,9 +77,11 @@ impl<'a> Matcher<'a> {
     }
 }
 
-/// A token's match: the bytes to mark at its start, and the terms it matched.
+/// A token's match: the byte range to mark (all or part of the token), and
+/// the terms it matched.
 struct Mark {
-    marked_bytes: usize,
+    from: usize,
+    to: usize,
     terms: Vec<usize>,
 }
 
@@ -89,7 +98,22 @@ fn mark_for(original: &str, token: &Token, matcher: &Matcher) -> Option<Mark> {
         .map(|h| h.marked_chars.map_or(whole, |n| original_prefix_bytes(word, n)))
         .max()
         .unwrap_or(whole);
-    Some(Mark { marked_bytes, terms: hits.iter().map(|h| h.term).collect() })
+    Some(Mark { from: token.start, to: token.start + marked_bytes, terms: hits.iter().map(|h| h.term).collect() })
+}
+
+/// The mark of a word, or else of the parts inside it that matched (from
+/// the first matched part to the last).
+fn mark_with_parts(original: &str, token: &Token, parts: &[Token], matcher: &Matcher) -> Option<Mark> {
+    if let Some(mark) = mark_for(original, token, matcher) {
+        return Some(mark);
+    }
+    let marks: Vec<Mark> = parts.iter().filter_map(|p| mark_for(original, p, matcher)).collect();
+    let from = marks.iter().map(|m| m.from).min()?;
+    let to = marks.iter().map(|m| m.to).max()?;
+    let mut terms: Vec<usize> = marks.into_iter().flat_map(|m| m.terms).collect();
+    terms.sort_unstable();
+    terms.dedup();
+    Some(Mark { from, to, terms })
 }
 
 /// Byte length of the shortest start of `original` whose normalized form has
@@ -130,11 +154,11 @@ fn render(text: &str, tokens: &[(Token, Option<Mark>)], from: usize, to: usize, 
         if token.start < from || token.end > to {
             continue;
         }
-        escape(&text[cursor..token.start], &mut out);
+        escape(&text[cursor..mark.from], &mut out);
         out.push_str(&tags.pre);
-        escape(&text[token.start..token.start + mark.marked_bytes], &mut out);
+        escape(&text[mark.from..mark.to], &mut out);
         out.push_str(&tags.post);
-        cursor = token.start + mark.marked_bytes;
+        cursor = mark.to;
     }
     escape(&text[cursor..to], &mut out);
     out
@@ -150,11 +174,12 @@ fn match_level(matched: &BTreeSet<usize>, n_terms: usize) -> &'static str {
     }
 }
 
+/// The words of `text` (parts folded into their word) with their marks.
 fn analyse(text: &str, matcher: &Matcher) -> Vec<(Token, Option<Mark>)> {
-    tokenize(text)
+    group_parts(tokenize_with(text, matcher.segmentation))
         .into_iter()
-        .map(|t| {
-            let mark = mark_for(text, &t, matcher);
+        .map(|(t, parts)| {
+            let mark = mark_with_parts(text, &t, &parts, matcher);
             (t, mark)
         })
         .collect()
@@ -169,7 +194,7 @@ fn highlight_text(text: &str, matcher: &Matcher, tags: &HighlightTags) -> Value 
         "matchedWords": matched.iter().map(|&t| matcher.terms[t]).collect::<Vec<_>>(),
     });
     if !matched.is_empty() {
-        let fully = tokens.iter().all(|(t, m)| m.as_ref().is_some_and(|m| m.marked_bytes == t.end - t.start));
+        let fully = tokens.iter().all(|(t, m)| m.as_ref().is_some_and(|m| m.from == t.start && m.to == t.end));
         result["fullyHighlighted"] = Value::Bool(fully);
     }
     result
@@ -303,7 +328,7 @@ mod tests {
 
     fn hl(index: &Index, query: &str, text: &str) -> Value {
         let terms = plan(index, query);
-        highlight_text(text, &Matcher::new(&terms), &HighlightTags::default())
+        highlight_text(text, &Matcher::new(&terms, Segmentation::default()), &HighlightTags::default())
     }
 
     #[test]
@@ -355,7 +380,7 @@ mod tests {
                     consensus for replication, then raft again at the very end of the text.";
         index.add(json!({"objectID": "1", "body": body})).unwrap();
         let terms = plan(&index, "raft consensus");
-        let m = Matcher::new(&terms);
+        let m = Matcher::new(&terms, Segmentation::default());
         let s = snippet_text(body, 5, &m, &HighlightTags::default());
         assert_eq!(s["value"], "… discuss <em>Raft</em> and <em>consensus</em> for …");
         assert_eq!(s["matchLevel"], "full");
@@ -367,7 +392,7 @@ mod tests {
     fn snippet_without_match_shows_the_start() {
         let index = index();
         let terms = plan(&index, "zzz");
-        let s = snippet_text("one two three four", 2, &Matcher::new(&terms), &HighlightTags::default());
+        let s = snippet_text("one two three four", 2, &Matcher::new(&terms, Segmentation::default()), &HighlightTags::default());
         assert_eq!(s["value"], "one two …");
         assert_eq!(s["matchLevel"], "none");
     }
@@ -379,7 +404,7 @@ mod tests {
         let terms = plan(&index, "usb 1996");
         let tags = HighlightTags { pre: "[".into(), post: "]".into(), ellipsis: "...".into() };
         let record = index.store().get(0).unwrap();
-        let r = highlight(&record, &["features".into(), "year".into(), "missing".into()], &Matcher::new(&terms), &tags, |_| true);
+        let r = highlight(&record, &["features".into(), "year".into(), "missing".into()], &Matcher::new(&terms, Segmentation::default()), &tags, |_| true);
         assert_eq!(r["features"][0]["value"], "fast charging");
         assert_eq!(r["features"][1]["value"], "[USB]-C");
         assert_eq!(r["year"]["value"], "[1996]");

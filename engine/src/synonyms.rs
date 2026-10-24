@@ -8,7 +8,7 @@
 //! A regular synonym makes every word stand for every other one; a one-way
 //! synonym only expands `input`. Only single words are supported for now.
 
-use crate::tokenizer::tokenize;
+use crate::tokenizer::{Segmentation, tokenize_with};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -32,9 +32,11 @@ enum RawSynonym {
     },
 }
 
-/// Normalizes a synonym word; it must be exactly one word.
-fn one_word(word: &str) -> Result<String, String> {
-    let tokens = tokenize(word);
+/// Normalizes a synonym word; it must be exactly one word. Chinese and
+/// Japanese synonyms are split into words like any text, so "笔记本电脑"
+/// (two words) needs multi-word synonyms.
+fn one_word(word: &str, segmentation: Segmentation) -> Result<String, String> {
+    let tokens = tokenize_with(word, segmentation);
     match tokens.as_slice() {
         [token] => Ok(token.text.clone()),
         [] => Err(format!("empty synonym {word:?}")),
@@ -50,7 +52,7 @@ impl TryFrom<RawSynonym> for Synonym {
             if words.len() < min {
                 return Err(format!("a synonym needs at least {min} word(s)"));
             }
-            words.iter().try_for_each(|w| one_word(w).map(|_| ()))
+            words.iter().try_for_each(|w| one_word(w, Segmentation::default()).map(|_| ()))
         };
         match raw {
             RawSynonym::Synonym { synonyms } => {
@@ -58,7 +60,7 @@ impl TryFrom<RawSynonym> for Synonym {
                 Ok(Synonym::Synonym { synonyms })
             }
             RawSynonym::OneWaySynonym { input, synonyms } => {
-                one_word(&input)?;
+                one_word(&input, Segmentation::default())?;
                 check(&synonyms, 1)?;
                 Ok(Synonym::OneWaySynonym { input, synonyms })
             }
@@ -67,9 +69,10 @@ impl TryFrom<RawSynonym> for Synonym {
 }
 
 /// Normalized word -> the words it can stand for.
-pub fn build_map(synonyms: &[Synonym]) -> HashMap<String, Vec<String>> {
+pub fn build_map(synonyms: &[Synonym], segmentation: Segmentation) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    let normalized = |words: &[String]| -> Vec<String> { words.iter().filter_map(|w| one_word(w).ok()).collect() };
+    let normalized =
+        |words: &[String]| -> Vec<String> { words.iter().filter_map(|w| one_word(w, segmentation).ok()).collect() };
     for synonym in synonyms {
         match synonym {
             Synonym::Synonym { synonyms } => {
@@ -80,7 +83,7 @@ pub fn build_map(synonyms: &[Synonym]) -> HashMap<String, Vec<String>> {
                 }
             }
             Synonym::OneWaySynonym { input, synonyms } => {
-                if let Ok(from) = one_word(input) {
+                if let Ok(from) = one_word(input, segmentation) {
                     map.entry(from.clone()).or_default().extend(normalized(synonyms).into_iter().filter(|w| *w != from));
                 }
             }
@@ -108,7 +111,7 @@ mod tests {
             parse(json!({"type": "synonym", "synonyms": ["TV", "Télévision", "telly"]})).unwrap(),
             parse(json!({"type": "oneWaySynonym", "input": "phone", "synonyms": ["smartphone"]})).unwrap(),
         ];
-        let map = build_map(&s);
+        let map = build_map(&s, Segmentation::default());
         assert_eq!(map["tv"], ["television", "telly"]);
         assert_eq!(map["television"], ["telly", "tv"]);
         assert_eq!(map["phone"], ["smartphone"]);

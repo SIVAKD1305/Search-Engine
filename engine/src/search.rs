@@ -16,12 +16,13 @@ use crate::language::{is_stop_word, plural_forms};
 use crate::bucket::rank_page;
 use crate::ranking::{RankingInfo, TermWords};
 use crate::store::DocId;
-use crate::tokenizer::{normalize, tokenize};
+use crate::tokenizer::{Token, group_parts, is_cjk_word, normalize, tokenize_with};
 use crate::typo::{Matches, PrefixMatch, WordMatch, fuzzy_matches};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::ops::Bound;
 
 #[derive(Debug)]
 pub struct QueryTerm {
@@ -92,49 +93,148 @@ pub fn plan(index: &Index, query: &str) -> Vec<QueryTerm> {
 }
 
 pub fn plan_with(index: &Index, query: &str, options: &QueryOptions) -> Vec<QueryTerm> {
-    let mut tokens = tokenize(query);
-    let last = tokens.len().saturating_sub(1);
+    let mut words = group_parts(tokenize_with(query, index.segmentation().with_parts()));
+    let last = words.len().saturating_sub(1);
     if options.remove_stop_words {
         // The last word is kept: the user may still be typing a longer word.
         let mut i = 0;
-        tokens.retain(|t| {
+        words.retain(|(t, _)| {
             let keep = i == last || !is_stop_word(&t.text);
             i += 1;
             keep
         });
     }
-    let last = tokens.len().saturating_sub(1);
-    tokens
-        .into_iter()
-        .enumerate()
-        .map(|(i, token)| {
-            let is_prefix = i == last;
-            let max_typos = index.settings().typo.max_typos(token.text.chars().count());
-            let Matches { words: mut matches, prefixes } =
-                fuzzy_matches(index.dictionary(), &token.text, max_typos, is_prefix);
-
-            let mut alternatives: Vec<String> = Vec::new();
-            if options.ignore_plurals {
-                alternatives.extend(plural_forms(&token.text));
-            }
-            if options.synonyms {
-                alternatives.extend(index.synonyms_of(&token.text).iter().cloned());
-            }
-            for word in alternatives {
-                if word == token.text || index.word(&word).is_none() {
-                    continue;
+    join_cut_words(index, &mut words, options);
+    let last = words.len().saturating_sub(1);
+    let mut terms = Vec::with_capacity(words.len());
+    for (i, (token, parts)) in words.into_iter().enumerate() {
+        let is_prefix = i == last;
+        let term = plan_term(index, token.text.clone(), is_prefix, options);
+        if term.matches.is_empty() && term.prefixes.is_empty() && is_cjk_word(&token.text) {
+            // A Chinese or Japanese word that no record contains as a whole:
+            // look for its parts instead ("国際空港" in "関西国際空港").
+            if let Some(cover) = covering_parts(&token, parts) {
+                let n = cover.len();
+                for (j, part) in cover.into_iter().enumerate() {
+                    terms.push(plan_term(index, part.text, is_prefix && j + 1 == n, options));
                 }
-                // A plural found as a typo or prefix match counts as no typo.
-                matches.retain(|m| m.word != word);
-                matches.push(WordMatch { word, typos: 0, prefix: false, derived: true });
+                continue;
             }
+            if is_prefix && let Some((head, tail)) = split_typed_word(index, &token.text, options) {
+                terms.push(head);
+                terms.push(tail);
+                continue;
+            }
+        }
+        terms.push(term);
+    }
+    terms
+}
 
-            matches.sort_by(|a, b| a.typos.cmp(&b.typos).then_with(|| a.word.cmp(&b.word)));
-            let docs = term_docs(index, &matches, &prefixes);
-            let optional = options.optional_words.contains(&token.text);
-            QueryTerm { text: token.text, is_prefix, optional, matches, prefixes, docs }
-        })
-        .collect()
+/// A half-typed last word that splits coarser than the records: "ペンチオ"
+/// is one word, but the record has ペンチ + オノマトペ. Splits it into a whole
+/// word and the start of the next, both in one record; the longest whole
+/// word wins.
+fn split_typed_word(index: &Index, text: &str, options: &QueryOptions) -> Option<(QueryTerm, QueryTerm)> {
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).skip(1).collect();
+    for &end in ends.iter().rev() {
+        if index.word(&text[..end]).is_none() {
+            continue;
+        }
+        let tail = plan_term(index, text[end..].to_owned(), true, options);
+        let head = plan_term(index, text[..end].to_owned(), false, options);
+        if !head.docs.is_disjoint(&tail.docs) {
+            return Some((head, tail));
+        }
+    }
+    None
+}
+
+/// While Chinese or Japanese is typed, the last word is often cut short, and
+/// a cut word can split differently from the whole one: "セルフタイマ" gives
+/// セルフ + タイマ, while "セルフタイマー" is one word. When no record has
+/// all the words of the query's last unspaced run, joins the run's trailing
+/// words back into one, if that starts a word in the index (the longest such
+/// join wins).
+fn join_cut_words(index: &Index, words: &mut Vec<(Token, Vec<Token>)>, options: &QueryOptions) {
+    let Some(last) = words.len().checked_sub(1) else { return };
+    let joinable = |a: &Token, b: &Token| a.end == b.start && is_cjk_word(&a.text) && is_cjk_word(&b.text);
+    let mut first = last;
+    while first > 0 && joinable(&words[first - 1].0, &words[first].0) {
+        first -= 1;
+    }
+    if first == last {
+        return;
+    }
+    // Keep the split when some record matches it.
+    let mut docs: Option<RoaringBitmap> = None;
+    for (i, (token, _)) in words.iter().enumerate().skip(first) {
+        let term_docs = plan_term(index, token.text.clone(), i == last, options).docs;
+        docs = Some(match docs {
+            None => term_docs,
+            Some(d) => d & term_docs,
+        });
+    }
+    if docs.is_some_and(|d| !d.is_empty()) {
+        return;
+    }
+    for i in first..last {
+        let joined: String = words[i..].iter().map(|(t, _)| t.text.as_str()).collect();
+        let starts_a_word = index
+            .dictionary()
+            .range::<str, _>((Bound::Included(joined.as_str()), Bound::Unbounded))
+            .next()
+            .is_some_and(|(w, _)| w.starts_with(&joined));
+        if starts_a_word {
+            let (start, position) = (words[i].0.start, words[i].0.position);
+            let end = words[last].0.end;
+            words.truncate(i);
+            words.push((Token { text: joined, position, element: 0, start, end, part: false }, Vec::new()));
+            return;
+        }
+    }
+}
+
+/// Parts that cover the whole token without overlapping, longest first at
+/// each step; `None` unless there are at least two.
+fn covering_parts(token: &Token, mut parts: Vec<Token>) -> Option<Vec<Token>> {
+    parts.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    let mut cover: Vec<Token> = Vec::new();
+    let mut cursor = token.start;
+    for part in parts {
+        if part.start == cursor {
+            cursor = part.end;
+            cover.push(part);
+        }
+    }
+    (cursor == token.end && cover.len() >= 2).then_some(cover)
+}
+
+fn plan_term(index: &Index, text: String, is_prefix: bool, options: &QueryOptions) -> QueryTerm {
+    // A different Chinese or Japanese character is a different word, not a typo.
+    let max_typos = if is_cjk_word(&text) { 0 } else { index.settings().typo.max_typos(text.chars().count()) };
+    let Matches { words: mut matches, prefixes } = fuzzy_matches(index.dictionary(), &text, max_typos, is_prefix);
+
+    let mut alternatives: Vec<String> = Vec::new();
+    if options.ignore_plurals {
+        alternatives.extend(plural_forms(&text));
+    }
+    if options.synonyms {
+        alternatives.extend(index.synonyms_of(&text).iter().cloned());
+    }
+    for word in alternatives {
+        if word == text || index.word(&word).is_none() {
+            continue;
+        }
+        // A plural found as a typo or prefix match counts as no typo.
+        matches.retain(|m| m.word != word);
+        matches.push(WordMatch { word, typos: 0, prefix: false, derived: true });
+    }
+
+    matches.sort_by(|a, b| a.typos.cmp(&b.typos).then_with(|| a.word.cmp(&b.word)));
+    let docs = term_docs(index, &matches, &prefixes);
+    let optional = options.optional_words.contains(&text);
+    QueryTerm { text, is_prefix, optional, matches, prefixes, docs }
 }
 
 fn term_docs(index: &Index, matches: &[WordMatch], prefixes: &[PrefixMatch]) -> RoaringBitmap {
@@ -298,7 +398,7 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
         }
     }
     let query_after_removal = (!removed.is_empty()).then(|| {
-        tokenize(&params.query)
+        tokenize_with(&params.query, index.segmentation())
             .iter()
             .map(|t| {
                 let original = &params.query[t.start..t.end];
@@ -335,7 +435,7 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
     let offset = params.page.saturating_mul(hits_per_page);
     let page = rank_page(index, &terms, &candidates, &boosts, offset, hits_per_page).into_iter();
 
-    let matcher = Matcher::new(&terms);
+    let matcher = Matcher::new(&terms, index.segmentation());
     // Which attributes of a record hold a matched word, from the record's
     // word list, so highlighting can skip the others.
     let term_words: Vec<TermWords> = terms.iter().map(|t| TermWords::new(index, t)).collect();
@@ -834,7 +934,7 @@ mod highlight_shortcut_tests {
                 ..SearchParams::new(query)
             };
             let results = search(&index, &params).unwrap();
-            let matcher = Matcher::new(&results.terms);
+            let matcher = Matcher::new(&results.terms, index.segmentation());
             for hit in &results.hits {
                 let record = index.store().get(hit.doc).unwrap();
                 let attributes = params.attributes_to_highlight.as_ref().unwrap();
@@ -845,3 +945,104 @@ mod highlight_shortcut_tests {
     }
 }
 
+
+#[cfg(all(test, feature = "chinese", feature = "japanese"))]
+mod cjk_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn index(languages: &[&str], names: &[&str]) -> Index {
+        let settings = json!({"searchableAttributes": ["name"], "indexLanguages": languages});
+        let mut index = Index::new(serde_json::from_value(settings).unwrap());
+        for (i, name) in names.iter().enumerate() {
+            index.add(json!({"objectID": (i + 1).to_string(), "name": name})).unwrap();
+        }
+        index
+    }
+
+    /// objectIDs of the hits.
+    fn ids(index: &Index, query: &str) -> Vec<String> {
+        search(index, &SearchParams::new(query))
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn highlighted(index: &Index, query: &str) -> String {
+        let results = search(index, &SearchParams::new(query)).unwrap();
+        results.hits[0].highlight["name"]["value"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn japanese_words_parts_and_prefixes_are_found() {
+        let shop = index(&["ja"], &["関西国際空港限定トートバッグ", "東京タワーの置物", "ワイヤレスイヤホン Bluetooth対応", "ハックの本"]);
+        assert_eq!(ids(&shop, "トートバッグ"), ["1"]);
+        // A part of a compound word, and a word made of two parts.
+        assert_eq!(ids(&shop, "空港"), ["1"]);
+        assert_eq!(ids(&shop, "国際空港"), ["1"]);
+        // Kanji only, split as Japanese because the index says so.
+        assert_eq!(ids(&shop, "対応"), ["3"]);
+        // Typing: the last word is a prefix.
+        assert_eq!(ids(&shop, "東京タ"), ["2"]);
+        // Voiced kana are different letters: バッグ is not ハック.
+        assert_eq!(ids(&shop, "ハック"), ["4"]);
+        // No typo tolerance: one different character is another word.
+        assert!(ids(&shop, "東高タワー").is_empty());
+        assert_eq!(highlighted(&shop, "空港"), "関西国際<em>空港</em>限定トートバッグ");
+        assert_eq!(highlighted(&shop, "東京 タワー"), "<em>東京</em><em>タワー</em>の置物");
+    }
+
+    #[test]
+    fn chinese_words_and_parts_are_found() {
+        let shop = index(&[], &["无线蓝牙耳机降噪", "清华大学出版社", "蓝牙音箱"]);
+        assert_eq!(ids(&shop, "蓝牙耳机"), ["1"]);
+        assert_eq!(ids(&shop, "大学"), ["2"]);
+        let mut both = ids(&shop, "蓝牙");
+        both.sort();
+        assert_eq!(both, ["1", "3"]);
+        assert_eq!(highlighted(&shop, "大学"), "清华<em>大学</em>出版社");
+    }
+
+    #[test]
+    fn a_word_no_record_contains_whole_is_searched_by_its_parts() {
+        let shop = index(&[], &["清华 大学 出版社", "北京大学"]);
+        let terms = plan(&shop, "清华大学");
+        assert_eq!(terms.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(), ["清华", "大学"]);
+        assert!(!terms[0].is_prefix && terms[1].is_prefix);
+        assert_eq!(ids(&shop, "清华大学"), ["1"]);
+        // A word the records do contain is not split.
+        assert_eq!(plan(&shop, "北京大学").len(), 1);
+    }
+
+    #[test]
+    fn a_word_cut_short_while_typing_is_joined_back() {
+        let shop = index(&["ja"], &["セルフタイマー付きカメラ", "インターナショナルスクール"]);
+        let words = |q: &str| plan(&shop, q).into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(words("セルフタイマ"), ["セルフタイマ"]);
+        assert_eq!(ids(&shop, "セルフタイマ"), ["1"]);
+        assert_eq!(ids(&shop, "インターナシ"), ["2"]);
+        // Words that match as they are stay split.
+        assert_eq!(words("セルフタイマー付き").len(), 2);
+        let zh = index(&[], &["目瞪口呆的表情", "日内瓦湖"]);
+        assert_eq!(ids(&zh, "目瞪口"), ["1"]);
+        assert_eq!(ids(&zh, "日内"), ["2"]);
+    }
+
+    #[test]
+    fn a_typed_word_that_spans_two_record_words_is_split() {
+        let shop = index(&["ja"], &["ペンチオノマトペです"]);
+        assert_eq!(plan(&shop, "ペンチオ").into_iter().map(|t| t.text).collect::<Vec<_>>(), ["ペンチ", "オ"]);
+        assert_eq!(ids(&shop, "ペンチオ"), ["1"]);
+        let zh = index(&[], &["一个我们一个套装"]);
+        assert_eq!(ids(&zh, "一个我们一个套"), ["1"]);
+    }
+
+    #[test]
+    fn full_width_letters_match_ascii_queries() {
+        let shop = index(&["ja"], &["Ｗｉｆｉ対応ルーター"]);
+        assert_eq!(ids(&shop, "wifi"), ["1"]);
+        assert_eq!(ids(&shop, "ルーター"), ["1"]);
+    }
+}
