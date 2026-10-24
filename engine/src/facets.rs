@@ -7,12 +7,13 @@
 //!   in a sorted set of (value, record), so a range filter is one ordered scan.
 
 use crate::store::DocId;
+use crate::index::ordered;
 use crate::tokenizer::normalize;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 /// One `attributesForFaceting` entry: `brand`, or `filterOnly(brand)` to allow
@@ -209,9 +210,96 @@ impl Ord for Number {
     }
 }
 
+/// Record sets for ranges of values at three levels of detail, so a range
+/// filter unions a few ready-made sets instead of collecting every record.
+/// A level's bucket is `key >> shift`, where `key` is the value mapped to
+/// a u64 in the same order (`ordered`).
+const LEVEL_SHIFTS: [u32; 3] = [56, 48, 40];
+
+#[derive(Debug, Default)]
+struct NumericValues {
+    /// Every (value, record) pair, for exact edges and removals.
+    values: BTreeSet<(Number, DocId)>,
+    /// One map per level: bucket -> records with a value in it.
+    levels: [BTreeMap<u64, RoaringBitmap>; 3],
+}
+
+impl NumericValues {
+    fn insert(&mut self, n: f64, id: DocId) {
+        if self.values.insert((Number(n), id)) {
+            let key = ordered(n);
+            for (level, shift) in self.levels.iter_mut().zip(LEVEL_SHIFTS) {
+                level.entry(key >> shift).or_default().insert(id);
+            }
+        }
+    }
+
+    fn remove(&mut self, n: f64, id: DocId) {
+        if !self.values.remove(&(Number(n), id)) {
+            return;
+        }
+        let key = ordered(n);
+        // The record may have another value in the same bucket (arrays).
+        for (level, shift) in self.levels.iter_mut().zip(LEVEL_SHIFTS) {
+            let bucket = key >> shift;
+            let start = unordered(bucket << shift);
+            let end = unordered((bucket << shift) | ((1u64 << shift) - 1));
+            let still_there = self
+                .values
+                .range((Number(start), DocId::MIN)..=(Number(end), DocId::MAX))
+                .any(|&(_, d)| d == id);
+            if !still_there && let Some(docs) = level.get_mut(&bucket) {
+                docs.remove(id);
+                if docs.is_empty() {
+                    level.remove(&bucket);
+                }
+            }
+        }
+    }
+
+    /// Records with a value whose key is in `lo..=hi`, using level `depth`
+    /// and finer ones.
+    fn collect(&self, lo: u64, hi: u64, depth: usize, out: &mut RoaringBitmap) {
+        if lo > hi {
+            return;
+        }
+        let Some(&shift) = LEVEL_SHIFTS.get(depth) else {
+            // Finer than every level: scan the values themselves.
+            let range = (Number(unordered(lo)), DocId::MIN)..=(Number(unordered(hi)), DocId::MAX);
+            out.extend(self.values.range(range).map(|&(_, d)| d));
+            return;
+        };
+        let size = 1u64 << shift;
+        let first_full = if lo.is_multiple_of(size) { lo / size } else { lo / size + 1 };
+        let last_full = if hi % size == size - 1 { hi / size } else { (hi / size).wrapping_sub(1) };
+        if hi / size < first_full || last_full == u64::MAX || first_full > last_full {
+            // No whole bucket fits: refine.
+            self.collect(lo, hi, depth + 1, out);
+            return;
+        }
+        for (_, docs) in self.levels[depth].range(first_full..=last_full) {
+            *out |= docs;
+        }
+        // The partial buckets at both ends, at the next level.
+        if lo < first_full * size {
+            self.collect(lo, first_full * size - 1, depth + 1, out);
+        }
+        let end_of_full = last_full * size + (size - 1);
+        if hi > end_of_full {
+            self.collect(end_of_full + 1, hi, depth + 1, out);
+        }
+    }
+}
+
+/// The inverse of `ordered`.
+fn unordered(key: u64) -> f64 {
+    let bits = if key >> 63 == 1 { key & !(1 << 63) } else { !key };
+    f64::from_bits(bits)
+}
+
 #[derive(Debug, Default)]
 pub struct NumericIndex {
-    attributes: HashMap<String, BTreeSet<(Number, DocId)>>,
+    attributes: HashMap<String, NumericValues>,
 }
 
 fn numbers(value: &Value) -> Vec<f64> {
@@ -227,18 +315,21 @@ impl NumericIndex {
     pub fn add(&mut self, id: DocId, doc: &Map<String, Value>) {
         for (attribute, value) in doc {
             for n in numbers(value) {
-                self.attributes.entry(attribute.clone()).or_default().insert((Number(n), id));
+                if !self.attributes.contains_key(attribute) {
+                    self.attributes.insert(attribute.clone(), NumericValues::default());
+                }
+                self.attributes.get_mut(attribute).expect("just ensured").insert(n, id);
             }
         }
     }
 
     pub fn remove(&mut self, id: DocId, doc: &Map<String, Value>) {
         for (attribute, value) in doc {
-            let Some(set) = self.attributes.get_mut(attribute) else { continue };
+            let Some(values) = self.attributes.get_mut(attribute) else { continue };
             for n in numbers(value) {
-                set.remove(&(Number(n), id));
+                values.remove(n, id);
             }
-            if set.is_empty() {
+            if values.values.is_empty() {
                 self.attributes.remove(attribute);
             }
         }
@@ -246,32 +337,27 @@ impl NumericIndex {
 
     /// Records with at least one value of `attribute` inside the bounds.
     pub fn docs(&self, attribute: &str, low: Bound<f64>, high: Bound<f64>) -> RoaringBitmap {
-        let Some(set) = self.attributes.get(attribute) else { return RoaringBitmap::new() };
-        let low = match low {
-            Bound::Included(x) => Bound::Included((Number(x + 0.0), DocId::MIN)),
-            Bound::Excluded(x) => Bound::Excluded((Number(x + 0.0), DocId::MAX)),
-            Bound::Unbounded => Bound::Unbounded,
+        let Some(values) = self.attributes.get(attribute) else { return RoaringBitmap::new() };
+        // Inclusive bounds in key space.
+        let lo = match low {
+            Bound::Included(x) => ordered(x + 0.0),
+            Bound::Excluded(x) => match ordered(x + 0.0).checked_add(1) {
+                Some(k) => k,
+                None => return RoaringBitmap::new(),
+            },
+            Bound::Unbounded => 0,
         };
-        let high = match high {
-            Bound::Included(x) => Bound::Included((Number(x + 0.0), DocId::MAX)),
-            Bound::Excluded(x) => Bound::Excluded((Number(x + 0.0), DocId::MIN)),
-            Bound::Unbounded => Bound::Unbounded,
+        let hi = match high {
+            Bound::Included(x) => ordered(x + 0.0),
+            Bound::Excluded(x) => match ordered(x + 0.0).checked_sub(1) {
+                Some(k) => k,
+                None => return RoaringBitmap::new(),
+            },
+            Bound::Unbounded => u64::MAX - 2,
         };
-        if is_empty_range(&low, &high) {
-            return RoaringBitmap::new();
-        }
-        set.range((low, high)).map(|(_, id)| *id).collect()
-    }
-}
-
-/// `BTreeSet::range` panics when the start is after the end.
-fn is_empty_range<T: Ord>(low: &Bound<T>, high: &Bound<T>) -> bool {
-    match (low, high) {
-        (Bound::Included(l), Bound::Included(h)) => l > h,
-        (Bound::Included(l), Bound::Excluded(h))
-        | (Bound::Excluded(l), Bound::Included(h))
-        | (Bound::Excluded(l), Bound::Excluded(h)) => l >= h,
-        _ => false,
+        let mut out = RoaringBitmap::new();
+        values.collect(lo, hi, 0, &mut out);
+        out
     }
 }
 
@@ -387,6 +473,48 @@ mod tests {
             let counted: Vec<(String, u64)> =
                 f.counts("tag", &candidates, usize::MAX).into_iter().map(|c| (c.value, c.count)).collect();
             assert_eq!(counted, by_value, "candidates {}", candidates.len());
+        }
+    }
+
+    #[test]
+    fn range_filters_agree_with_a_plain_scan() {
+        let mut seed = 3u64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut n = NumericIndex::default();
+        let mut plain: Vec<(f64, u32)> = Vec::new();
+        let pool = [-1e6, -250.5, -3.0, -0.5, 0.0, 0.25, 1.0, 1.5, 2.0, 2.01, 3.99, 4.0, 19.99, 20.0, 499.0, 1e9];
+        let value = |k: u64| -> f64 {
+            if k.is_multiple_of(2) { pool[(k / 2) as usize % pool.len()] } else { (k as f64 - 2000.0) / 7.0 }
+        };
+        for id in 0..2000u32 {
+            let values: Vec<f64> = (0..1 + next(2)).map(|_| value(next(4000))).collect();
+            n.add(id, &doc(json!({ "x": values })));
+            plain.extend(values.iter().map(|&v| (v, id)));
+        }
+        // Remove some records, keeping the plain list in step.
+        for id in (0..2000u32).step_by(5) {
+            let values: Vec<f64> = plain.iter().filter(|(_, d)| *d == id).map(|(v, _)| *v).collect();
+            n.remove(id, &doc(json!({ "x": values })));
+            plain.retain(|(_, d)| *d != id);
+        }
+        for _ in 0..300 {
+            let (a, b) = (value(next(4000)), value(next(4000)));
+            let bound = |x: f64, kind: u64| match kind {
+                0 => Included(x),
+                1 => Excluded(x),
+                _ => Unbounded,
+            };
+            let (low, high) = (bound(a.min(b), next(3)), bound(a.max(b), next(3)));
+            let inside = |v: f64| {
+                let above = match low { Included(x) => v >= x, Excluded(x) => v > x, Unbounded => true };
+                let below = match high { Included(x) => v <= x, Excluded(x) => v < x, Unbounded => true };
+                above && below
+            };
+            let expected: RoaringBitmap = plain.iter().filter(|(v, _)| inside(*v)).map(|(_, d)| *d).collect();
+            assert_eq!(n.docs("x", low, high), expected, "{low:?} {high:?}");
         }
     }
 }

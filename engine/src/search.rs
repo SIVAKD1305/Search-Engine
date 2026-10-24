@@ -14,10 +14,10 @@ use crate::highlight::{self, HighlightTags, Matcher};
 use crate::index::{Index, Settings};
 use crate::language::{is_stop_word, plural_forms};
 use crate::bucket::rank_page;
-use crate::ranking::RankingInfo;
+use crate::ranking::{RankingInfo, TermWords};
 use crate::store::DocId;
 use crate::tokenizer::{normalize, tokenize};
-use crate::typo::{WordMatch, fuzzy_matches};
+use crate::typo::{Matches, PrefixMatch, WordMatch, fuzzy_matches};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -30,9 +30,11 @@ pub struct QueryTerm {
     pub is_prefix: bool,
     /// Records may match without this word; it only helps ranking.
     pub optional: bool,
-    /// Dictionary words this term can match, fewest typos first.
+    /// Single dictionary words this term can match, fewest typos first.
     pub matches: Vec<WordMatch>,
-    /// Records containing at least one of `matches`.
+    /// Groups of words, by shared prefix, this term matches as a prefix.
+    pub prefixes: Vec<PrefixMatch>,
+    /// Records containing at least one of the matched words.
     pub docs: RoaringBitmap,
 }
 
@@ -108,7 +110,8 @@ pub fn plan_with(index: &Index, query: &str, options: &QueryOptions) -> Vec<Quer
         .map(|(i, token)| {
             let is_prefix = i == last;
             let max_typos = index.settings().typo.max_typos(token.text.chars().count());
-            let mut matches = fuzzy_matches(index.dictionary(), &token.text, max_typos, is_prefix);
+            let Matches { words: mut matches, prefixes } =
+                fuzzy_matches(index.dictionary(), &token.text, max_typos, is_prefix);
 
             let mut alternatives: Vec<String> = Vec::new();
             if options.ignore_plurals {
@@ -127,24 +130,22 @@ pub fn plan_with(index: &Index, query: &str, options: &QueryOptions) -> Vec<Quer
             }
 
             matches.sort_by(|a, b| a.typos.cmp(&b.typos).then_with(|| a.word.cmp(&b.word)));
-            let docs = term_docs(index, &token.text, is_prefix, max_typos, &matches);
+            let docs = term_docs(index, &matches, &prefixes);
             let optional = options.optional_words.contains(&token.text);
-            QueryTerm { text: token.text, is_prefix, optional, matches, docs }
+            QueryTerm { text: token.text, is_prefix, optional, matches, prefixes, docs }
         })
         .collect()
 }
 
-fn term_docs(index: &Index, text: &str, is_prefix: bool, max_typos: u8, matches: &[WordMatch]) -> RoaringBitmap {
+fn term_docs(index: &Index, matches: &[WordMatch], prefixes: &[PrefixMatch]) -> RoaringBitmap {
     let mut docs = RoaringBitmap::new();
-    // Exact prefix: one precomputed set instead of a union over every word.
-    let fast_prefix = is_prefix && max_typos == 0;
-    if fast_prefix {
-        docs = index.prefix_docs(text).cloned().unwrap_or_default();
+    // A prefix group is one precomputed set, however many words it holds.
+    for p in prefixes {
+        if let Some(prefix_docs) = index.prefix_docs(&p.prefix) {
+            docs |= prefix_docs;
+        }
     }
     for m in matches {
-        if fast_prefix && !m.derived {
-            continue;
-        }
         if let Some(postings) = index.word(&m.word) {
             docs |= &postings.docs;
         }
@@ -335,6 +336,18 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
     let page = rank_page(index, &terms, &candidates, &boosts, offset, hits_per_page).into_iter();
 
     let matcher = Matcher::new(&terms);
+    // Which attributes of a record hold a matched word, from the record's
+    // word list, so highlighting can skip the others.
+    let term_words: Vec<TermWords> = terms.iter().map(|t| TermWords::new(index, t)).collect();
+    let matched_attributes = |doc: DocId| -> Vec<bool> {
+        let mut matched = vec![false; index.attributes().len()];
+        for o in index.occurrences(doc) {
+            if term_words.iter().any(|w| w.get(o.word).is_some()) {
+                matched[usize::from(o.attribute)] = true;
+            }
+        }
+        matched
+    };
     let tags = HighlightTags {
         pre: params.highlight_pre_tag.clone(),
         post: params.highlight_post_tag.clone(),
@@ -348,10 +361,14 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
     let hits = page
         .map(|r| {
             let record = index.store().get(r.doc).expect("ranked record is live");
+            let matched = matched_attributes(r.doc);
+            // Attributes that are not searchable are not in the word list.
+            let may_match =
+                |name: &str| index.attributes().iter().position(|a| a == name).is_none_or(|i| matched[i]);
             SearchHit {
                 doc: r.doc,
                 info: r.info,
-                highlight: highlight::highlight(record, &to_highlight, &matcher, &tags),
+                highlight: highlight::highlight(record, &to_highlight, &matcher, &tags, may_match),
                 snippet: highlight::snippet(record, &params.attributes_to_snippet, &matcher, &tags),
             }
         })
@@ -458,10 +475,21 @@ mod tests {
     #[test]
     fn typo_matches_are_listed_fewest_typos_first() {
         let index = index_with(Settings::default());
+        let expanded = |term: &QueryTerm| -> Vec<(String, u8, bool)> {
+            let all = Matches { words: term.matches.clone(), prefixes: term.prefixes.clone() };
+            all.expand(index.dictionary()).into_iter().map(|m| (m.word, m.typos, m.prefix)).collect()
+        };
+        // Still typing: "headphones" matches as a prefix group, and the
+        // whole word "headphone" stays an exact match.
         let terms = plan(&index, "headphone ");
-        let words: Vec<(&str, u8)> = terms[0].matches.iter().map(|m| (m.word.as_str(), m.typos)).collect();
-        assert_eq!(words, [("headphone", 0), ("headphones", 0)]);
+        assert_eq!(terms[0].prefixes, [PrefixMatch { prefix: "headphone".into(), typos: 0 }]);
+        assert_eq!(
+            expanded(&terms[0]),
+            [("headphone".into(), 0, false), ("headphones".into(), 0, true)]
+        );
+        // A finished word: "headphones" is one typo away.
         let terms = plan(&index, "headphone stand");
+        assert!(terms[0].prefixes.is_empty());
         let words: Vec<(&str, u8)> = terms[0].matches.iter().map(|m| (m.word.as_str(), m.typos)).collect();
         assert_eq!(words, [("headphone", 0), ("headphones", 1)]);
     }
@@ -770,3 +798,47 @@ mod query_tests {
         assert!(serde_json::from_value::<Settings>(json!({"removeWordsIfNoResults": "some"})).is_err());
     }
 }
+
+#[cfg(test)]
+mod highlight_shortcut_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn skipping_unmatched_attributes_changes_nothing() {
+        let settings: Settings = serde_json::from_value(json!({
+            "searchableAttributes": ["name", "tags", "description"]
+        }))
+        .unwrap();
+        let mut index = Index::new(settings);
+        let words = ["wireless", "head", "headphones", "black", "kettle", "Élan", "steel", "lamp"];
+        for id in 0..200usize {
+            let pick = |k: usize| words[(id * 7 + k * 3) % words.len()];
+            index
+                .add(json!({
+                    "objectID": id.to_string(),
+                    "name": format!("{} {}", pick(0), pick(1)),
+                    "tags": [pick(2), pick(3)],
+                    "description": format!("A {} with a {} & <b>{}</b>", pick(4), pick(5), pick(6)),
+                    "brand": pick(7),
+                }))
+                .unwrap();
+        }
+        for query in ["wirless", "head", "elan ste", "black kettle", "lamp", "zzz", ""] {
+            let params = SearchParams {
+                attributes_to_highlight: Some(vec!["name".into(), "tags".into(), "description".into(), "brand".into()]),
+                hits_per_page: 50,
+                ..SearchParams::new(query)
+            };
+            let results = search(&index, &params).unwrap();
+            let matcher = Matcher::new(&results.terms);
+            for hit in &results.hits {
+                let record = index.store().get(hit.doc).unwrap();
+                let attributes = params.attributes_to_highlight.as_ref().unwrap();
+                let full = highlight::highlight(record, attributes, &matcher, &HighlightTags::default(), |_| true);
+                assert_eq!(hit.highlight, full, "query {query:?} record {}", record["objectID"]);
+            }
+        }
+    }
+}
+

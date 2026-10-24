@@ -41,23 +41,32 @@ struct WordHit {
 /// Looks up tokens among the query's matched words. Built once per search.
 pub struct Matcher<'a> {
     words: HashMap<&'a str, Vec<WordHit>>,
+    /// (prefix, hit) for prefix groups: a token starting with the prefix matches.
+    prefixes: Vec<(&'a str, WordHit)>,
     terms: Vec<&'a str>,
 }
 
 impl<'a> Matcher<'a> {
     pub fn new(terms: &'a [QueryTerm]) -> Self {
         let mut words: HashMap<&str, Vec<WordHit>> = HashMap::new();
+        let mut prefixes = Vec::new();
         for (term, t) in terms.iter().enumerate() {
+            let typed = t.text.chars().count();
             for m in &t.matches {
-                let marked_chars = m.prefix.then(|| t.text.chars().count());
+                let marked_chars = m.prefix.then_some(typed);
                 words.entry(m.word.as_str()).or_default().push(WordHit { term, marked_chars });
             }
+            for p in &t.prefixes {
+                prefixes.push((p.prefix.as_str(), WordHit { term, marked_chars: Some(typed) }));
+            }
         }
-        Matcher { words, terms: terms.iter().map(|t| t.text.as_str()).collect() }
+        Matcher { words, prefixes, terms: terms.iter().map(|t| t.text.as_str()).collect() }
     }
 
-    fn lookup(&self, token: &Token) -> &[WordHit] {
-        self.words.get(token.text.as_str()).map_or(&[], Vec::as_slice)
+    fn lookup(&self, token: &Token) -> Vec<WordHit> {
+        let mut hits = self.words.get(token.text.as_str()).cloned().unwrap_or_default();
+        hits.extend(self.prefixes.iter().filter(|(p, _)| token.text.starts_with(p)).map(|(_, h)| *h));
+        hits
     }
 }
 
@@ -232,13 +241,33 @@ fn per_value(value: &Value, f: impl Fn(&str) -> Value) -> Option<Value> {
     }
 }
 
+/// The highlight of a text known to contain no matched word.
+fn unmatched_text(text: &str) -> Value {
+    let mut value = String::with_capacity(text.len());
+    escape(text, &mut value);
+    json!({ "value": value, "matchLevel": "none", "matchedWords": [] })
+}
+
 /// `_highlightResult` for the given attributes of one record.
-pub fn highlight(record: &Map<String, Value>, attributes: &[String], matcher: &Matcher, tags: &HighlightTags) -> Map<String, Value> {
+/// `may_match(attribute)` returns false for attributes known to contain no
+/// matched word; those are escaped without being tokenized.
+pub fn highlight(
+    record: &Map<String, Value>,
+    attributes: &[String],
+    matcher: &Matcher,
+    tags: &HighlightTags,
+    may_match: impl Fn(&str) -> bool,
+) -> Map<String, Value> {
     attributes
         .iter()
         .filter_map(|a| {
             let value = record.get(a)?;
-            per_value(value, |t| highlight_text(t, matcher, tags)).map(|v| (a.clone(), v))
+            let highlighted = if may_match(a) {
+                per_value(value, |t| highlight_text(t, matcher, tags))
+            } else {
+                per_value(value, unmatched_text)
+            };
+            highlighted.map(|v| (a.clone(), v))
         })
         .collect()
 }
@@ -350,7 +379,7 @@ mod tests {
         let terms = plan(&index, "usb 1996");
         let tags = HighlightTags { pre: "[".into(), post: "]".into(), ellipsis: "...".into() };
         let record = index.store().get(0).unwrap();
-        let r = highlight(record, &["features".into(), "year".into(), "missing".into()], &Matcher::new(&terms), &tags);
+        let r = highlight(record, &["features".into(), "year".into(), "missing".into()], &Matcher::new(&terms), &tags, |_| true);
         assert_eq!(r["features"][0]["value"], "fast charging");
         assert_eq!(r["features"][1]["value"], "[USB]-C");
         assert_eq!(r["year"]["value"], "[1996]");

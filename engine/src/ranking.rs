@@ -123,11 +123,9 @@ pub(crate) struct TermWords {
 impl TermWords {
     pub(crate) fn new(index: &Index, term: &QueryTerm) -> Self {
         let mut codes = vec![0u8; index.word_id_limit()];
-        for m in &term.matches {
-            let Some(postings) = index.word(&m.word) else { continue };
-            let exact = m.typos == 0 && !m.prefix && !m.derived;
-            let code = 1 | (m.typos.min(3) << 1) | (u8::from(exact) << 3);
-            let slot = &mut codes[postings.id as usize];
+        let mut set = |id: WordId, typos: u8, exact: bool| {
+            let code = 1 | (typos.min(3) << 1) | (u8::from(exact) << 3);
+            let slot = &mut codes[id as usize];
             *slot = match *slot {
                 0 => code,
                 old => {
@@ -136,6 +134,15 @@ impl TermWords {
                     1 | (typos << 1) | ((old | code) & 8)
                 }
             };
+        };
+        for p in &term.prefixes {
+            for id in index.word_ids_with_prefix(&p.prefix) {
+                set(id, p.typos, false);
+            }
+        }
+        for m in &term.matches {
+            let Some(postings) = index.word(&m.word) else { continue };
+            set(postings.id, m.typos, m.typos == 0 && !m.prefix && !m.derived);
         }
         TermWords { codes }
     }

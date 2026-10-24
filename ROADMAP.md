@@ -36,10 +36,16 @@
    `profile_query`, `loadtest`. Results and findings in
    [docs/benchmarks.md](docs/benchmarks.md): 1M records index in 506 s, use
    8.1 GB, p50 10.8 ms, p99 127 ms; about 580 HTTP requests/s at 100k.
-3. Query time at scale: bitmap-level ranking for huge result sets,
-   precomputed custom-ranking order, per-record position lookup for prefixes
-   with many words (findings 1 and 2)
-4. Typo speed on big dictionaries; cheaper highlighting (finding 3)
+3. ✅ Query time at scale: per-record word lists instead of per-word position
+   maps, ranking with set operations, a custom-ranking order kept sorted on
+   every write, facet counts per record for small results (100k catalog:
+   p99 17.6 -> 12.9 ms, memory 958 -> 721 MB)
+4. ✅ Typo and filter speed: first-letter typo budget prunes the dictionary
+   walk; prefix matches reported as groups (one precomputed set instead of
+   hundreds of words); highlighting skips attributes without a match; ASCII
+   fast path in the tokenizer; numeric range filters from three levels of
+   precomputed buckets (100k catalog: mean 5.1 -> 1.9 ms, p99 12.9 -> 5.4 ms,
+   529 queries/s per core)
 5. Indexing speed and memory; group commit for single writes; faster
    startup (findings 4 and 5)
 6. Chinese/Japanese word segmentation
@@ -81,6 +87,8 @@
   `/synonyms` API (here synonyms are a setting), plurals and stop words for
   languages other than English (`queryLanguages`), and splitting or joining
   words ("head phones" = "headphones").
+- Facet counts on very large results (30k+ hits over 2,000 brands) take
+  5–9 ms; Algolia approximates counts there (`exhaustiveFacetsCount: false`).
 - Facets not yet done: `facets_stats` (min/max/avg of numeric facets),
   searching inside facet values (`searchForFacetValues`), nested attributes
   (`brand.name`), and geo filters (`aroundLatLng`, the `geo` criterion).

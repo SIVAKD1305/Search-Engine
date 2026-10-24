@@ -59,6 +59,23 @@ pub struct WordMatch {
     pub derived: bool,
 }
 
+/// Every dictionary word starting with `prefix` matches the query as a
+/// prefix, with `typos` typos. Reported instead of listing the words, which
+/// can be thousands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixMatch {
+    pub prefix: String,
+    pub typos: u8,
+}
+
+/// What a query word matches: single words, and whole groups of words
+/// sharing a prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Matches {
+    pub words: Vec<WordMatch>,
+    pub prefixes: Vec<PrefixMatch>,
+}
+
 /// Finds dictionary words within `max_typos` of `query`.
 ///
 /// With `prefix`, a word also matches when `query` is close to its beginning,
@@ -69,7 +86,7 @@ pub fn fuzzy_matches<V>(
     query: &str,
     max_typos: u8,
     prefix: bool,
-) -> Vec<WordMatch> {
+) -> Matches {
     if max_typos == 0 {
         return exact_matches(dictionary, query, prefix);
     }
@@ -77,13 +94,23 @@ pub fn fuzzy_matches<V>(
     let n = query.len();
     let limit = u32::from(max_typos);
 
-    let mut matches = Vec::new();
+    let mut matches = Matches::default();
     let mut word: Vec<char> = Vec::new();
     // Distance table, one row of `width` cells per character of `word`;
     // row 0 compares the query with the empty string.
     let width = n + 1;
     let mut table: Vec<u32> = (0..=n as u32).collect();
-    let mut keys = dictionary.range::<str, _>(..);
+    // A different first letter costs one more typo, so with one typo
+    // allowed only words starting with the query's first letter can match.
+    let mut keys = if limit == 1 {
+        let first = query[0].to_string();
+        match successor(&query[..1]) {
+            Some(end) => dictionary.range::<str, _>((Bound::Included(first.as_str()), Bound::Excluded(end.as_str()))),
+            None => dictionary.range::<str, _>((Bound::Included(first.as_str()), Bound::Unbounded)),
+        }
+    } else {
+        dictionary.range::<str, _>(..)
+    };
     let mut chars: Vec<char> = Vec::new();
 
     'words: while let Some((key, _)) = keys.next() {
@@ -93,6 +120,9 @@ pub fn fuzzy_matches<V>(
         let shared = word.iter().zip(&chars).take_while(|(a, b)| a == b).count();
         word.truncate(shared);
         table.truncate((shared + 1) * width);
+        // Words with another first letter pay one extra typo at the end, so
+        // they may only use `limit - 1` along the way: prune them sooner.
+        let budget = if chars.first() == query.first() { limit } else { limit - 1 };
 
         // Best distance of the query against any prefix of this word.
         let mut best_prefix = if prefix {
@@ -101,7 +131,7 @@ pub fn fuzzy_matches<V>(
             u32::MAX
         };
 
-        let mut complete = true;
+        let penalty = |distance: u32| distance + u32::from(distance > 0 && query.first() != chars.first());
         for &c in &chars[shared..] {
             word.push(c);
             push_row(&mut table, &word, &query);
@@ -110,14 +140,31 @@ pub fn fuzzy_matches<V>(
             if prefix {
                 best_prefix = best_prefix.min(row[n]);
             }
-            if row_min > limit {
-                if best_prefix <= limit {
-                    // The query already matched a prefix of this word, and
-                    // longer words cannot do better: the rest of the word
-                    // does not matter.
-                    complete = false;
-                    break;
+            // The query matches a prefix of `word`, and longer words cannot
+            // do better (their distances are at least `row_min`): every word
+            // starting with `word` matches the same way.
+            if prefix && best_prefix <= budget && (row_min > budget || best_prefix == 0) {
+                let here = word.len() == chars.len();
+                let full = row[n];
+                if here && full <= best_prefix {
+                    // This word itself, matched whole (an exact word stays exact).
+                    matches.words.push(WordMatch {
+                        word: key.to_owned(),
+                        typos: penalty(full) as u8,
+                        prefix: false,
+                        derived: false,
+                    });
                 }
+                matches.prefixes.push(PrefixMatch { prefix: word.iter().collect(), typos: penalty(best_prefix) as u8 });
+                match successor(&word) {
+                    Some(next) => {
+                        keys = dictionary.range::<str, _>((Bound::Included(next.as_str()), Bound::Unbounded));
+                    }
+                    None => break 'words,
+                }
+                continue 'words;
+            }
+            if row_min > budget {
                 // Nothing that starts with `word` can match; skip all of it.
                 match successor(&word) {
                     Some(next) => {
@@ -129,32 +176,54 @@ pub fn fuzzy_matches<V>(
             }
         }
 
-        let full = if complete { table[table.len() - 1] } else { u32::MAX };
+        let full = table[table.len() - 1];
         let (distance, is_prefix) =
             if prefix && best_prefix < full { (best_prefix, true) } else { (full, false) };
-        let first_letter_penalty = u32::from(query.first() != chars.first());
-        let typos = distance + if distance > 0 { first_letter_penalty } else { 0 };
+        let typos = penalty(distance);
         if typos <= limit {
-            matches.push(WordMatch { word: key.to_owned(), typos: typos as u8, prefix: is_prefix, derived: false });
+            matches.words.push(WordMatch { word: key.to_owned(), typos: typos as u8, prefix: is_prefix, derived: false });
         }
     }
     matches
 }
 
-fn exact_matches<V>(dictionary: &BTreeMap<String, V>, query: &str, prefix: bool) -> Vec<WordMatch> {
-    if !prefix {
-        return dictionary
-            .get_key_value(query)
-            .map(|(w, _)| WordMatch { word: w.clone(), typos: 0, prefix: false, derived: false })
-            .into_iter()
-            .collect();
+fn exact_matches<V>(dictionary: &BTreeMap<String, V>, query: &str, prefix: bool) -> Matches {
+    let words = dictionary
+        .get_key_value(query)
+        .map(|(w, _)| WordMatch { word: w.clone(), typos: 0, prefix: false, derived: false })
+        .into_iter()
+        .collect();
+    let any_with_prefix = prefix
+        && dictionary.range::<str, _>((Bound::Included(query), Bound::Unbounded)).next().is_some_and(|(w, _)| w.starts_with(query));
+    let prefixes =
+        if any_with_prefix { vec![PrefixMatch { prefix: query.to_owned(), typos: 0 }] } else { Vec::new() };
+    Matches { words, prefixes }
+}
+
+impl Matches {
+    /// Every matched word with its typos and whether it matched as a prefix,
+    /// expanding prefix groups (slow for big groups; for tests and display).
+    pub fn expand<V>(&self, dictionary: &BTreeMap<String, V>) -> Vec<WordMatch> {
+        let mut all: BTreeMap<String, WordMatch> = BTreeMap::new();
+        let mut add = |m: WordMatch| {
+            let better = all.get(&m.word).is_none_or(|old| (m.typos, m.prefix) < (old.typos, old.prefix));
+            if better {
+                all.insert(m.word.clone(), m);
+            }
+        };
+        for p in &self.prefixes {
+            for (word, _) in dictionary
+                .range::<str, _>((Bound::Included(p.prefix.as_str()), Bound::Unbounded))
+                .take_while(|(w, _)| w.starts_with(&p.prefix))
+            {
+                add(WordMatch { word: word.clone(), typos: p.typos, prefix: true, derived: false });
+            }
+        }
+        for w in &self.words {
+            add(w.clone());
+        }
+        all.into_values().collect()
     }
-    dictionary
-        .range::<str, _>((Bound::Included(query), Bound::Unbounded))
-        .map(|(w, _)| w)
-        .take_while(|w| w.starts_with(query))
-        .map(|w| WordMatch { word: w.clone(), typos: 0, prefix: w.len() > query.len(), derived: false })
-        .collect()
 }
 
 /// Appends the distance row for `word` (whose last char is new) against
@@ -202,7 +271,7 @@ mod tests {
     }
 
     fn found(d: &BTreeMap<String, ()>, q: &str, max: u8, prefix: bool) -> Vec<(String, u8, bool)> {
-        fuzzy_matches(d, q, max, prefix).into_iter().map(|m| (m.word, m.typos, m.prefix)).collect()
+        fuzzy_matches(d, q, max, prefix).expand(d).into_iter().map(|m| (m.word, m.typos, m.prefix)).collect()
     }
 
     /// Plain O(n·m) reference implementation, used to check the trie walk.
@@ -291,7 +360,7 @@ mod tests {
                     .map(|w| w.to_string())
                     .collect();
                 expected.sort();
-                let got: Vec<String> = fuzzy_matches(&d, query, max, false).into_iter().map(|m| m.word).collect();
+                let got: Vec<String> = fuzzy_matches(&d, query, max, false).expand(&d).into_iter().map(|m| m.word).collect();
                 assert_eq!(got, expected, "query {query:?} max {max}");
             }
         }
@@ -318,8 +387,63 @@ mod tests {
                     .collect();
                 expected.sort();
                 let got: Vec<(String, u8)> =
-                    fuzzy_matches(&d, query, max, true).into_iter().map(|m| (m.word, m.typos)).collect();
+                    fuzzy_matches(&d, query, max, true).expand(&d).into_iter().map(|m| (m.word, m.typos)).collect();
                 assert_eq!(got, expected, "query {query:?} max {max}");
+            }
+        }
+    }
+
+    #[test]
+    fn random_dictionaries_agree_with_brute_force() {
+        let mut seed = 5u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % n as u64) as usize
+        };
+        let letters: Vec<char> = "abcdeilnorstu".chars().collect();
+        let mut words: Vec<String> = (0..1000)
+            .map(|_| (0..2 + next(9)).map(|_| letters[next(letters.len())]).collect())
+            .collect();
+        words.sort();
+        words.dedup();
+        let d = dict(&words.iter().map(String::as_str).collect::<Vec<_>>());
+        for _ in 0..80 {
+            // A dictionary word with up to two random edits.
+            let mut q: Vec<char> = words[next(words.len())].chars().collect();
+            for _ in 0..next(3) {
+                let i = next(q.len());
+                match next(3) {
+                    0 => q[i] = letters[next(letters.len())],
+                    1 if q.len() > 1 => {
+                        q.remove(i);
+                    }
+                    _ => q.insert(i, letters[next(letters.len())]),
+                }
+            }
+            let query: String = q.into_iter().collect();
+            for max in [1u8, 2] {
+                for prefix in [false, true] {
+                    let mut expected: Vec<(String, u8)> = words
+                        .iter()
+                        .filter_map(|w| {
+                            let dist = if prefix {
+                                (1..=w.chars().count())
+                                    .map(|k| osa_distance(&query, &w.chars().take(k).collect::<String>()))
+                                    .min()
+                                    .unwrap()
+                            } else {
+                                osa_distance(&query, w)
+                            };
+                            let penalty = u32::from(dist > 0 && query.chars().next() != w.chars().next());
+                            (dist + penalty <= u32::from(max)).then(|| (w.clone(), (dist + penalty) as u8))
+                        })
+                        .collect();
+                    expected.sort();
+                    let mut got: Vec<(String, u8)> =
+                        fuzzy_matches(&d, &query, max, prefix).expand(&d).into_iter().map(|m| (m.word, m.typos)).collect();
+                    got.sort();
+                    assert_eq!(got, expected, "query {query:?} max {max} prefix {prefix}");
+                }
             }
         }
     }

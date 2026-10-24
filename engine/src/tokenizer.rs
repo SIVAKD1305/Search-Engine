@@ -33,6 +33,10 @@ pub struct Token {
 /// decompose (ß, æ, ø, ...). Non-word characters are kept as-is; callers
 /// split on them.
 pub fn normalize(text: &str) -> String {
+    // Most words are plain ASCII: lowercasing is all there is to do.
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
     let mut out = String::with_capacity(text.len());
     for c in text.nfd() {
         push_normalized(c, &mut out);
@@ -165,6 +169,20 @@ mod tests {
         assert_eq!(normalize("Straße Æsir Øre Łódź"), "strasse aesir ore lodz");
         // Already-decomposed input (e + combining acute) gives the same result.
         assert_eq!(normalize("Cafe\u{301}"), "cafe");
+    }
+
+    #[test]
+    fn ascii_fast_path_matches_full_normalization() {
+        let full = |text: &str| {
+            let mut out = String::new();
+            for c in text.nfd() {
+                push_normalized(c, &mut out);
+            }
+            out
+        };
+        for text in ["Kettle", "USB-C 5.3", "ABC xyz 019", "", "  MiXeD  ", "a_b~c!"] {
+            assert_eq!(normalize(text), full(text), "{text:?}");
+        }
     }
 
     #[test]

@@ -143,15 +143,17 @@ impl<'a> Signals<'a> {
         for term in terms {
             let mut by_typos: [RoaringBitmap; 3] = Default::default();
             let mut exact = RoaringBitmap::new();
-            // A prefix matched without typos covers every word starting with
-            // it: use the precomputed prefix sets instead of thousands of unions.
-            let no_typos = term.matches.iter().all(|m| m.typos == 0);
-            let whole_prefix = term.is_prefix && no_typos;
+            let no_typos = term.matches.iter().all(|m| m.typos == 0) && term.prefixes.iter().all(|p| p.typos == 0);
             if no_typos {
                 by_typos[0] = term.docs.clone();
             }
-            if whole_prefix {
-                add_attributes(index.prefix_docs_by_attribute(&term.text));
+            // Prefix groups use the index's precomputed prefix sets, so a
+            // group of thousands of words costs one set.
+            for p in &term.prefixes {
+                if !no_typos && let Some(docs) = index.prefix_docs(&p.prefix) {
+                    by_typos[usize::from(p.typos).min(2)] |= docs;
+                }
+                add_attributes(index.prefix_docs_by_attribute(&p.prefix));
             }
             for m in &term.matches {
                 let Some(postings) = index.word(&m.word) else { continue };
@@ -161,9 +163,7 @@ impl<'a> Signals<'a> {
                 if m.typos == 0 && !m.prefix && !m.derived {
                     exact |= &postings.docs;
                 }
-                if !whole_prefix || m.derived {
-                    add_attributes(&postings.by_attribute);
-                }
+                add_attributes(&postings.by_attribute);
             }
             // A record counts at its best (lowest) typo level only.
             let level0 = by_typos[0].clone();

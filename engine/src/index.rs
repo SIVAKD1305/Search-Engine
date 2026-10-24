@@ -263,6 +263,14 @@ impl Index {
         self.prefixes.get(prefix).map_or(&[], |p| p.by_attribute.as_slice())
     }
 
+    /// Ids of the dictionary words starting with `prefix`.
+    pub fn word_ids_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = WordId> + 'a {
+        self.words
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(move |(w, _)| w.starts_with(prefix))
+            .map(|(_, p)| p.id)
+    }
+
     /// Dictionary words starting with `prefix`, in sorted order.
     pub fn words_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.words

@@ -53,9 +53,15 @@ fn run(index: &Index, base: &SearchParams, query: &str) {
         println!("  no results for every word; searched as: {after}");
     }
     for term in &results.terms {
-        let shown: Vec<String> =
-            term.matches.iter().take(4).map(|m| format!("{} ({} typo)", m.word, m.typos)).collect();
-        let more = term.matches.len().saturating_sub(shown.len());
+        // Prefix groups are shown as `prefix*`.
+        let all: Vec<String> = term
+            .prefixes
+            .iter()
+            .map(|p| format!("{}* ({} typo)", p.prefix, p.typos))
+            .chain(term.matches.iter().map(|m| format!("{} ({} typo)", m.word, m.typos)))
+            .collect();
+        let shown: Vec<String> = all.iter().take(4).cloned().collect();
+        let more = all.len().saturating_sub(shown.len());
         let more = if more > 0 { format!(" +{more} more") } else { String::new() };
         println!("  {:>12} -> {}{more}", term.text, shown.join(", "));
     }
