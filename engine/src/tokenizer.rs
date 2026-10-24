@@ -25,7 +25,7 @@ use unicode_normalization::char::is_combining_mark;
 /// elements never look adjacent. It equals the proximity cap used in ranking.
 pub const ELEMENT_GAP: u32 = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Token {
     /// Normalized form, e.g. `elan`.
     pub text: String,

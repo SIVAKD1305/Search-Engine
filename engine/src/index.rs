@@ -25,7 +25,7 @@ use roaring::RoaringBitmap;
 use serde_json::{Map, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 /// Index of an attribute in `searchable_attributes`; lower ranks higher.
@@ -166,9 +166,9 @@ pub struct Index {
     numbers: NumericIndex,
     /// Ids of all live records.
     live: RoaringBitmap,
-    /// Normalized word -> words it can stand for, from `settings.synonyms`.
+    /// Phrases and what they can stand for, from `settings.synonyms`.
     #[serde(skip)]
-    synonym_map: HashMap<String, Vec<String>>,
+    synonym_map: synonyms::SynonymMap,
     /// One column per `customRanking` rule: the rule's value for each DocId
     /// (NaN when missing), so ranking never reads record JSON.
     custom_columns: Vec<Vec<f64>>,
@@ -221,9 +221,14 @@ impl Index {
         Segmentation { han: HanLanguage::from_languages(&self.settings.index_languages), parts: false }
     }
 
-    /// Words that `word` (normalized) can stand for.
-    pub fn synonyms_of(&self, word: &str) -> &[String] {
-        self.synonym_map.get(word).map_or(&[], Vec::as_slice)
+    /// Phrases that `words` (normalized) can stand for.
+    pub fn synonyms_of(&self, words: &[String]) -> &[Vec<String>] {
+        self.synonym_map.get(words)
+    }
+
+    /// The longest phrase that has synonyms, in words.
+    pub fn longest_synonym(&self) -> usize {
+        self.synonym_map.longest()
     }
 
     /// The sorted word dictionary, for typo-tolerant lookups.

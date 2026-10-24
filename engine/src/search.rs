@@ -107,8 +107,18 @@ pub fn plan_with(index: &Index, query: &str, options: &QueryOptions) -> Vec<Quer
     join_cut_words(index, &mut words, options);
     let last = words.len().saturating_sub(1);
     let mut terms = Vec::with_capacity(words.len());
-    for (i, (token, parts)) in words.into_iter().enumerate() {
+    let mut i = 0;
+    while i < words.len() {
+        // Query words that together form a synonym entry ("new york").
+        if let Some((len, alternatives)) = synonym_span(index, &words[i..], options) {
+            let span: Vec<String> = words[i..i + len].iter().map(|(t, _)| t.text.clone()).collect();
+            terms.push(group_term(index, &span, alternatives, i + len - 1 == last, options));
+            i += len;
+            continue;
+        }
+        let (token, parts) = std::mem::take(&mut words[i]);
         let is_prefix = i == last;
+        i += 1;
         let term = plan_term(index, token.text.clone(), is_prefix, options);
         if term.matches.is_empty() && term.prefixes.is_empty() && is_cjk_word(&token.text) {
             // A Chinese or Japanese word that no record contains as a whole:
@@ -129,6 +139,86 @@ pub fn plan_with(index: &Index, query: &str, options: &QueryOptions) -> Vec<Quer
         terms.push(term);
     }
     terms
+}
+
+/// The longest run of two or more words at the start of `words` that is a
+/// synonym entry, with its alternatives.
+fn synonym_span<'a>(index: &'a Index, words: &[(Token, Vec<Token>)], options: &QueryOptions) -> Option<(usize, &'a [Vec<String>])> {
+    if !options.synonyms {
+        return None;
+    }
+    let longest = index.longest_synonym().min(words.len());
+    (2..=longest).rev().find_map(|len| {
+        let span: Vec<String> = words[..len].iter().map(|(t, _)| t.text.clone()).collect();
+        let alternatives = index.synonyms_of(&span);
+        (!alternatives.is_empty()).then_some((len, alternatives))
+    })
+}
+
+/// One term for query words that form a synonym entry: records with every
+/// word (as without synonyms), or with any alternative.
+fn group_term(index: &Index, span: &[String], alternatives: &[Vec<String>], includes_last: bool, options: &QueryOptions) -> QueryTerm {
+    let n = span.len();
+    let words: Vec<QueryTerm> =
+        span.iter().enumerate().map(|(j, w)| plan_term(index, w.clone(), includes_last && j + 1 == n, options)).collect();
+    let mut docs = words[0].docs.clone();
+    for w in &words[1..] {
+        docs &= &w.docs;
+    }
+    let optional = words.iter().all(|w| w.optional);
+    let (mut matches, mut prefixes) = (Vec::new(), Vec::new());
+    for w in words {
+        matches.extend(w.matches);
+        prefixes.extend(w.prefixes);
+    }
+    for alternative in alternatives {
+        add_alternative(index, alternative, &mut matches, &mut docs);
+    }
+    matches.sort_by(|a, b| a.typos.cmp(&b.typos).then_with(|| a.word.cmp(&b.word)));
+    matches.dedup_by(|b, a| a.word == b.word);
+    QueryTerm { text: span.join(" "), is_prefix: includes_last, optional, matches, prefixes, docs }
+}
+
+/// Adds a synonym (one word, or a phrase) to a term's matches and records.
+fn add_alternative(index: &Index, alternative: &[String], matches: &mut Vec<WordMatch>, docs: &mut RoaringBitmap) {
+    if alternative.iter().any(|w| index.word(w).is_none()) {
+        return;
+    }
+    *docs |= phrase_docs(index, alternative);
+    for word in alternative {
+        // A synonym found as a typo or prefix match counts as no typo.
+        matches.retain(|m| m.word != *word);
+        matches.push(WordMatch { word: word.clone(), typos: 0, prefix: false, derived: true });
+    }
+}
+
+/// Records where `words` appear next to each other, in order, in one
+/// attribute.
+fn phrase_docs(index: &Index, words: &[String]) -> RoaringBitmap {
+    let postings: Vec<_> = words.iter().filter_map(|w| index.word(w)).collect();
+    if postings.len() != words.len() {
+        return RoaringBitmap::new();
+    }
+    let mut candidates = postings[0].docs.clone();
+    for p in &postings[1..] {
+        candidates &= &p.docs;
+    }
+    if words.len() == 1 {
+        return candidates;
+    }
+    let ids: Vec<_> = postings.iter().map(|p| p.id).collect();
+    candidates
+        .into_iter()
+        .filter(|&doc| {
+            let occurrences = index.occurrences(doc);
+            occurrences.iter().filter(|o| o.word == ids[0]).any(|first| {
+                ids[1..].iter().enumerate().all(|(k, &id)| {
+                    let position = first.position + k as u32 + 1;
+                    occurrences.iter().any(|o| o.word == id && o.attribute == first.attribute && o.position == position)
+                })
+            })
+        })
+        .collect()
 }
 
 /// A half-typed last word that splits coarser than the records: "ペンチオ"
@@ -215,24 +305,26 @@ fn plan_term(index: &Index, text: String, is_prefix: bool, options: &QueryOption
     let max_typos = if is_cjk_word(&text) { 0 } else { index.settings().typo.max_typos(text.chars().count()) };
     let Matches { words: mut matches, prefixes } = fuzzy_matches(index.dictionary(), &text, max_typos, is_prefix);
 
-    let mut alternatives: Vec<String> = Vec::new();
     if options.ignore_plurals {
-        alternatives.extend(plural_forms(&text));
-    }
-    if options.synonyms {
-        alternatives.extend(index.synonyms_of(&text).iter().cloned());
-    }
-    for word in alternatives {
-        if word == text || index.word(&word).is_none() {
-            continue;
+        for word in plural_forms(&text) {
+            if word == text || index.word(&word).is_none() {
+                continue;
+            }
+            // A plural found as a typo or prefix match counts as no typo.
+            matches.retain(|m| m.word != word);
+            matches.push(WordMatch { word, typos: 0, prefix: false, derived: true });
         }
-        // A plural found as a typo or prefix match counts as no typo.
-        matches.retain(|m| m.word != word);
-        matches.push(WordMatch { word, typos: 0, prefix: false, derived: true });
+    }
+    let mut docs = term_docs(index, &matches, &prefixes);
+    if options.synonyms {
+        for alternative in index.synonyms_of(std::slice::from_ref(&text)) {
+            if *alternative != [text.clone()] {
+                add_alternative(index, alternative, &mut matches, &mut docs);
+            }
+        }
     }
 
     matches.sort_by(|a, b| a.typos.cmp(&b.typos).then_with(|| a.word.cmp(&b.word)));
-    let docs = term_docs(index, &matches, &prefixes);
     let optional = options.optional_words.contains(&text);
     QueryTerm { text, is_prefix, optional, matches, prefixes, docs }
 }
@@ -1078,9 +1170,98 @@ mod cjk_tests {
     }
 
     #[test]
+    fn chinese_synonyms_work_however_they_split() {
+        let settings = json!({"searchableAttributes": ["name"], "synonyms": [{"type": "synonym", "synonyms": ["笔记本电脑", "手提电脑"]}]});
+        let mut shop = Index::new(serde_json::from_value(settings).unwrap());
+        shop.add(json!({"objectID": "1", "name": "手提电脑包"})).unwrap();
+        shop.add(json!({"objectID": "2", "name": "笔记本电脑支架"})).unwrap();
+        let sorted = |q: &str| {
+            let mut v = ids(&shop, q);
+            v.sort();
+            v
+        };
+        assert_eq!(sorted("笔记本电脑"), ["1", "2"]);
+        assert_eq!(sorted("手提电脑"), ["1", "2"]);
+    }
+
+    #[test]
     fn full_width_letters_match_ascii_queries() {
         let shop = index(&["ja"], &["Ｗｉｆｉ対応ルーター"]);
         assert_eq!(ids(&shop, "wifi"), ["1"]);
         assert_eq!(ids(&shop, "ルーター"), ["1"]);
+    }
+}
+
+#[cfg(test)]
+mod synonym_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn index() -> Index {
+        let settings = json!({
+            "searchableAttributes": ["name"],
+            "synonyms": [
+                {"type": "synonym", "synonyms": ["ny", "new york", "nyc"]},
+                {"type": "oneWaySynonym", "input": "laptop", "synonyms": ["notebook computer"]}
+            ]
+        });
+        let mut index = Index::new(serde_json::from_value(settings).unwrap());
+        for (id, name) in [
+            "New York pizza",
+            "Pizza in NY",
+            "York new potatoes and pizza",
+            "NYC bagels",
+            "Notebook computer bag",
+            "Laptop stand",
+            "Computer notebook",
+        ]
+        .iter()
+        .enumerate()
+        {
+            index.add(json!({"objectID": (id + 1).to_string(), "name": name})).unwrap();
+        }
+        index
+    }
+
+    fn ids(index: &Index, params: &SearchParams) -> Vec<String> {
+        let mut ids: Vec<String> = search(index, params)
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_word_matches_a_phrase_only_when_its_words_are_adjacent() {
+        let index = index();
+        // "new york" as a phrase (1), "ny" itself (2), but not the scattered words (3).
+        assert_eq!(ids(&index, &SearchParams::new("ny pizza")), ["1", "2"]);
+        assert_eq!(ids(&index, &SearchParams::new("nyc")), ["1", "2", "4"]);
+        assert_eq!(ids(&index, &SearchParams::new("laptop")), ["5", "6"]);
+    }
+
+    #[test]
+    fn query_words_forming_an_entry_match_its_alternatives() {
+        let index = index();
+        // The words anywhere, as without synonyms (1, 3), or "ny" / "nyc" (2, 4).
+        assert_eq!(ids(&index, &SearchParams::new("new york")), ["1", "2", "3", "4"]);
+        assert_eq!(ids(&index, &SearchParams::new("new york pizza")), ["1", "2", "3"]);
+        // One-way: "notebook computer" does not mean "laptop".
+        assert_eq!(ids(&index, &SearchParams::new("notebook computer")), ["5", "7"]);
+        let terms = plan(&index, "new york pizza");
+        assert_eq!(terms.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(), ["new york", "pizza"]);
+    }
+
+    #[test]
+    fn synonyms_can_be_turned_off_and_are_highlighted() {
+        let index = index();
+        let off = SearchParams { synonyms: Some(false), ..SearchParams::new("ny pizza") };
+        assert_eq!(ids(&index, &off), ["2"]);
+        let results = search(&index, &SearchParams::new("ny pizza")).unwrap();
+        let first = results.hits.iter().find(|h| index.store().get(h.doc).unwrap()["objectID"] == "1").unwrap();
+        assert_eq!(first.highlight["name"]["value"], "<em>New</em> <em>York</em> <em>pizza</em>");
     }
 }
