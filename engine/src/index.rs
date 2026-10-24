@@ -15,7 +15,7 @@
 
 use crate::store::{DocId, DocumentStore, StoreError};
 use crate::tokenizer::{HanLanguage, Segmentation, tokenize_value};
-use crate::facets::{FacetAttribute, FacetCount, FacetIndex, NumericIndex};
+use crate::facets::{FacetAttribute, FacetCount, FacetIndex, FacetStats, NumericIndex};
 use crate::ranking::{CustomRule, Ranking};
 use crate::search::RemoveWords;
 use crate::synonyms::{self, Synonym};
@@ -182,7 +182,7 @@ pub struct Index {
 
 /// Changes whenever the layout of `Index` (or anything inside it) changes,
 /// so an old image is rejected instead of misread.
-const IMAGE_VERSION: u32 = 2;
+const IMAGE_VERSION: u32 = 3;
 
 /// Records with up to this many `customRanking` rules keep a sorted order.
 pub const MAX_ORDERED_RULES: usize = 4;
@@ -405,7 +405,14 @@ impl Index {
         self.facets.docs(attribute, value)
     }
 
-    pub fn facet_counts(&self, attribute: &str, candidates: &RoaringBitmap, limit: usize) -> Vec<FacetCount> {
+    /// The most frequent values among `candidates`, and the stats of the
+    /// numeric ones.
+    pub fn facet_counts(
+        &self,
+        attribute: &str,
+        candidates: &RoaringBitmap,
+        limit: usize,
+    ) -> (Vec<FacetCount>, Option<FacetStats>) {
         self.facets.counts(attribute, candidates, limit)
     }
 

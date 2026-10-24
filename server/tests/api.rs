@@ -595,3 +595,17 @@ async fn sources_and_referers_restrict_keys() {
     assert_eq!(with(&[("referer", "https://other.example.com/")]).await, StatusCode::FORBIDDEN);
     assert_eq!(with(&[]).await, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn numeric_facets_have_stats() {
+    let client = Client::new();
+    client.seed().await;
+    client.admin(Method::PUT, "/1/indexes/products/settings", Some(json!({"attributesForFaceting": ["brand", "price"]}))).await;
+    let response = client.search("products", json!({"query": "", "facets": ["brand", "price"]})).await;
+    assert_eq!(response["facets_stats"], json!({"price": {"min": 25.0, "max": 99.0, "avg": 54.666666666666664, "sum": 164.0}}));
+    // Over the matching records only.
+    let response = client.search("products", json!({"query": "wireless", "facets": ["*"]})).await;
+    assert_eq!(response["facets_stats"]["price"], json!({"min": 25.0, "max": 99.0, "avg": 62.0, "sum": 124.0}));
+    let response = client.search("products", json!({"query": "", "facets": ["brand"]})).await;
+    assert!(response.get("facets_stats").is_none());
+}

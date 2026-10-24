@@ -8,7 +8,7 @@
 //! matches at least one of its expansions; `optionalWords` and
 //! `removeWordsIfNoResults` relax that.
 
-use crate::facets::FacetCount;
+use crate::facets::{FacetCount, FacetStats};
 use crate::filter::{self, FilterError};
 use crate::highlight::{self, HighlightTags, Matcher};
 use crate::index::{Index, Settings};
@@ -354,6 +354,9 @@ pub struct SearchResults {
     pub hits_per_page: usize,
     /// Value counts per requested facet, over all hits (not just this page).
     pub facets: BTreeMap<String, Vec<FacetCount>>,
+    /// Min, max, average and sum of the requested facets with numeric
+    /// values, over all hits (Algolia's `facets_stats`).
+    pub facets_stats: BTreeMap<String, FacetStats>,
     /// The query words used, after any removal.
     pub terms: Vec<QueryTerm>,
     /// Set when words were removed: the query with removed words wrapped
@@ -428,15 +431,17 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut facets = BTreeMap::new();
+    let mut facets_stats = BTreeMap::new();
     for requested in &params.facets {
         let attributes: Vec<&str> =
             if requested == "*" { index.countable_facets().collect() } else { vec![requested.as_str()] };
         for attribute in attributes {
             if index.countable_facets().any(|a| a == attribute) {
-                facets.insert(
-                    attribute.to_owned(),
-                    index.facet_counts(attribute, &candidates, params.max_values_per_facet),
-                );
+                let (counts, stats) = index.facet_counts(attribute, &candidates, params.max_values_per_facet);
+                facets.insert(attribute.to_owned(), counts);
+                if let Some(stats) = stats {
+                    facets_stats.insert(attribute.to_owned(), stats);
+                }
             }
         }
     }
@@ -490,6 +495,7 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
         nb_pages: (nb_hits as usize).div_ceil(hits_per_page),
         hits_per_page,
         facets,
+        facets_stats,
         terms,
         query_after_removal,
     })

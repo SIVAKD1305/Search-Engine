@@ -280,6 +280,9 @@ fn run_search(index: &Index, params: &SearchParams, options: &ResponseOptions) -
     if !params.facets.is_empty() {
         response["facets"] = Value::Object(facets);
     }
+    if !results.facets_stats.is_empty() {
+        response["facets_stats"] = serde_json::to_value(&results.facets_stats).expect("serializable");
+    }
     if let Some(query) = &results.query_after_removal {
         response["queryAfterRemoval"] = json!(query);
     }

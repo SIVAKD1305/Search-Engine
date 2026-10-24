@@ -59,7 +59,19 @@ pub struct FacetCount {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct FacetValue {
     display: String,
+    /// The value as a number, when records give it as a JSON number.
+    number: Option<f64>,
     docs: RoaringBitmap,
+}
+
+/// Algolia's `facets_stats` for a numeric facet: over the matching records'
+/// values (each value counted once per record that has it).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct FacetStats {
+    pub min: f64,
+    pub max: f64,
+    pub avg: f64,
+    pub sum: f64,
 }
 
 /// One facet attribute. Values get permanent ids; each record keeps the ids
@@ -82,14 +94,14 @@ pub struct FacetIndex {
     attributes: HashMap<String, FacetValues>,
 }
 
-/// Text forms of a facet value: strings, numbers and booleans; arrays give
-/// one value per element.
-fn facet_values(value: &Value) -> Vec<String> {
-    fn scalar(v: &Value) -> Option<String> {
+/// Text forms of a facet value (with the number, for JSON numbers):
+/// strings, numbers and booleans; arrays give one value per element.
+fn facet_values(value: &Value) -> Vec<(String, Option<f64>)> {
+    fn scalar(v: &Value) -> Option<(String, Option<f64>)> {
         match v {
-            Value::String(s) => Some(s.trim().to_owned()).filter(|s| !s.is_empty()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::Bool(b) => Some(b.to_string()),
+            Value::String(s) => Some(s.trim().to_owned()).filter(|s| !s.is_empty()).map(|s| (s, None)),
+            Value::Number(n) => Some((n.to_string(), n.as_f64())),
+            Value::Bool(b) => Some((b.to_string(), None)),
             _ => None,
         }
     }
@@ -116,7 +128,7 @@ impl FacetIndex {
         for (attribute, facet) in &mut self.attributes {
             let Some(value) = doc.get(attribute) else { continue };
             let mut ids = Vec::new();
-            for display in facet_values(value) {
+            for (display, number) in facet_values(value) {
                 let key = facet_key(&display);
                 let value_id = match facet.ids.get(&key) {
                     Some(&v) => v,
@@ -131,6 +143,7 @@ impl FacetIndex {
                 if entry.docs.is_empty() {
                     entry.display = display;
                 }
+                entry.number = entry.number.or(number);
                 entry.docs.insert(id);
                 ids.push(value_id);
             }
@@ -158,9 +171,10 @@ impl FacetIndex {
     }
 
     /// Value counts among `candidates`, most frequent first (ties by value),
-    /// at most `limit` values.
-    pub fn counts(&self, attribute: &str, candidates: &RoaringBitmap, limit: usize) -> Vec<FacetCount> {
-        let Some(facet) = self.attributes.get(attribute) else { return Vec::new() };
+    /// at most `limit` values, and the stats of its numeric values when
+    /// there are some.
+    pub fn counts(&self, attribute: &str, candidates: &RoaringBitmap, limit: usize) -> (Vec<FacetCount>, Option<FacetStats>) {
+        let Some(facet) = self.attributes.get(attribute) else { return (Vec::new(), None) };
         let few_records = candidates.len() < RECORDS_PER_VALUE_FOR_RECORD_COUNTING * facet.values.len() as u64;
         let raw: Vec<(u32, u64)> = if few_records {
             let mut counts = vec![0u64; facet.values.len()];
@@ -179,13 +193,26 @@ impl FacetIndex {
                 .filter(|&(_, c)| c > 0)
                 .collect()
         };
+        let mut stats: Option<FacetStats> = None;
+        let mut weight = 0u64;
+        for &(v, count) in &raw {
+            let Some(n) = facet.values[v as usize].number else { continue };
+            weight += count;
+            let s = stats.get_or_insert(FacetStats { min: n, max: n, avg: 0.0, sum: 0.0 });
+            s.min = s.min.min(n);
+            s.max = s.max.max(n);
+            s.sum += n * count as f64;
+        }
+        if let Some(s) = &mut stats {
+            s.avg = s.sum / weight as f64;
+        }
         let mut counts: Vec<FacetCount> = raw
             .into_iter()
             .map(|(v, count)| FacetCount { value: facet.values[v as usize].display.clone(), count })
             .collect();
         counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
         counts.truncate(limit);
-        counts
+        (counts, stats)
     }
 }
 
@@ -392,10 +419,11 @@ mod tests {
         f.add(1, &doc(json!({"brand": "elan"})));
         f.add(2, &doc(json!({"brand": "Orbix"})));
         assert_eq!(ids(&f.docs("brand", "ELAN")), [0, 1]);
-        let counts = f.counts("brand", &(0..3).collect(), 10);
+        let (counts, stats) = f.counts("brand", &(0..3).collect(), 10);
         assert_eq!(counts[0], FacetCount { value: "Élan".into(), count: 2 });
+        assert_eq!(stats, None);
         f.remove(2);
-        assert_eq!(f.counts("brand", &(0..3).collect(), 10).len(), 1);
+        assert_eq!(f.counts("brand", &(0..3).collect(), 10).0.len(), 1);
     }
 
     #[test]
@@ -409,8 +437,24 @@ mod tests {
         assert_eq!(ids(&f.docs("in_stock", "true")), [0]);
         assert_eq!(ids(&f.docs("year", "1996")), [0]);
         let only_first: RoaringBitmap = [0].into_iter().collect();
-        let counts = f.counts("genres", &only_first, 10);
+        let (counts, _) = f.counts("genres", &only_first, 10);
         assert_eq!(counts.iter().map(|c| (c.value.as_str(), c.count)).collect::<Vec<_>>(), [("Drama", 1), ("Horror", 1)]);
+    }
+
+    #[test]
+    fn numeric_facets_have_stats_over_the_candidates() {
+        let mut f = FacetIndex::new(&[FacetAttribute::try_from("price".to_owned()).unwrap()]);
+        for (id, price) in [json!(10), json!(20.5), json!(20.5), json!([5, 100]), json!("n/a")].into_iter().enumerate() {
+            f.add(id as u32, &doc(json!({ "price": price })));
+        }
+        let (_, stats) = f.counts("price", &(0..5).collect(), 1);
+        // 10 + 20.5 + 20.5 + 5 + 100; the text value is left out; the limit
+        // on counts does not limit the stats.
+        assert_eq!(stats, Some(FacetStats { min: 5.0, max: 100.0, avg: 156.0 / 5.0, sum: 156.0 }));
+        let (_, stats) = f.counts("price", &[1, 2].into_iter().collect(), 10);
+        assert_eq!(stats, Some(FacetStats { min: 20.5, max: 20.5, avg: 20.5, sum: 41.0 }));
+        let (_, stats) = f.counts("price", &[4].into_iter().collect(), 10);
+        assert_eq!(stats, None);
     }
 
     #[test]
@@ -419,7 +463,7 @@ mod tests {
         for (id, c) in ["b", "a", "b", "c", "c", "c"].iter().enumerate() {
             f.add(id as u32, &doc(json!({ "c": c })));
         }
-        let counts = f.counts("c", &(0..6).collect(), 2);
+        let (counts, _) = f.counts("c", &(0..6).collect(), 2);
         assert_eq!(counts.iter().map(|c| (c.value.as_str(), c.count)).collect::<Vec<_>>(), [("c", 3), ("b", 2)]);
     }
 
@@ -471,7 +515,7 @@ mod tests {
                 c
             };
             let counted: Vec<(String, u64)> =
-                f.counts("tag", &candidates, usize::MAX).into_iter().map(|c| (c.value, c.count)).collect();
+                f.counts("tag", &candidates, usize::MAX).0.into_iter().map(|c| (c.value, c.count)).collect();
             assert_eq!(counted, by_value, "candidates {}", candidates.len());
         }
     }
