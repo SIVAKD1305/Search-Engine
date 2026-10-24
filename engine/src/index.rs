@@ -132,6 +132,23 @@ pub struct Index {
     /// Each record's words, sorted by (attribute, position); indexed by DocId.
     occurrences: Vec<Vec<Occurrence>>,
     next_word_id: WordId,
+    /// Every live record in `customRanking` order, kept up to date on each
+    /// write (only with 1 to MAX_ORDERED_RULES rules).
+    custom_order: BTreeSet<(CustomKey, DocId)>,
+}
+
+/// Records with up to this many `customRanking` rules keep a sorted order.
+pub const MAX_ORDERED_RULES: usize = 4;
+
+/// A record's `customRanking` values as one sortable key: smaller sorts
+/// first, directions are applied, missing values sort last.
+pub type CustomKey = [u64; MAX_ORDERED_RULES];
+
+/// Maps an f64 to a u64 with the same order (below u64::MAX - 1).
+pub(crate) fn ordered(v: f64) -> u64 {
+    let bits = (v + 0.0).to_bits();
+    let key = if bits >> 63 == 1 { !bits } else { bits | (1 << 63) };
+    key.min(u64::MAX - 2)
 }
 
 impl Index {
@@ -254,6 +271,11 @@ impl Index {
             .take_while(move |w| w.starts_with(prefix))
     }
 
+    /// Number of live records.
+    pub fn all_docs_len(&self) -> u64 {
+        self.live.len()
+    }
+
     /// Ids of all live records.
     pub fn all_docs(&self) -> RoaringBitmap {
         self.live.clone()
@@ -326,6 +348,31 @@ impl Index {
         (!value.is_nan()).then_some(value)
     }
 
+    /// The record's `customRanking` key. Rules beyond MAX_ORDERED_RULES are
+    /// not part of it.
+    pub fn custom_key(&self, doc: DocId) -> CustomKey {
+        let rules = &self.settings.custom_ranking;
+        std::array::from_fn(|i| match (rules.get(i), self.custom_value(i, doc)) {
+            (None, _) => 0,
+            (Some(rule), Some(v)) => {
+                let key = ordered(v);
+                if rule.descending { u64::MAX - 1 - key } else { key }
+            }
+            // Missing values sort last in either direction.
+            (Some(_), None) => u64::MAX,
+        })
+    }
+
+    /// Live records in `customRanking` order, with their keys; `None` when
+    /// the order is not kept (no rules, or more than MAX_ORDERED_RULES).
+    pub fn custom_order(&self) -> Option<impl Iterator<Item = &(CustomKey, DocId)>> {
+        self.keeps_custom_order().then(|| self.custom_order.iter())
+    }
+
+    fn keeps_custom_order(&self) -> bool {
+        (1..=MAX_ORDERED_RULES).contains(&self.settings.custom_ranking.len())
+    }
+
     fn index(&mut self, id: DocId, doc: &Map<String, Value>) {
         self.live.insert(id);
         for (rule, column) in self.settings.custom_ranking.iter().zip(&mut self.custom_columns) {
@@ -333,6 +380,9 @@ impl Index {
                 column.resize(id as usize + 1, f64::NAN);
             }
             column[id as usize] = doc.get(&rule.attribute).and_then(Value::as_f64).unwrap_or(f64::NAN);
+        }
+        if self.keeps_custom_order() {
+            self.custom_order.insert((self.custom_key(id), id));
         }
         self.facets.add(id, doc);
         self.numbers.add(id, doc);
@@ -385,12 +435,16 @@ impl Index {
     /// words, so no per-record word list has to be kept in memory.
     fn unindex(&mut self, id: DocId, old: &Map<String, Value>) {
         self.live.remove(id);
+        if self.keeps_custom_order() {
+            // The columns still hold the old values here.
+            self.custom_order.remove(&(self.custom_key(id), id));
+        }
         for column in &mut self.custom_columns {
             if let Some(value) = column.get_mut(id as usize) {
                 *value = f64::NAN;
             }
         }
-        self.facets.remove(id, old);
+        self.facets.remove(id);
         self.numbers.remove(id, old);
         if let Some(list) = self.occurrences.get_mut(id as usize) {
             *list = Vec::new();
@@ -540,4 +594,29 @@ mod tests {
         assert_eq!(index.attributes(), ["name"]);
         assert!(index.get_object("3").is_none());
     }
+
+    #[test]
+    fn custom_order_follows_writes() {
+        let settings: Settings =
+            serde_json::from_value(json!({"customRanking": ["desc(rating)", "asc(price)"]})).unwrap();
+        let mut index = Index::new(settings);
+        for (id, rating, price) in [("a", 3.0, 10), ("b", 5.0, 30), ("c", 5.0, 20)] {
+            index.add(json!({"objectID": id, "rating": rating, "price": price})).unwrap();
+        }
+        index.add(json!({"objectID": "d"})).unwrap();
+        let order = |index: &Index| -> Vec<String> {
+            index
+                .custom_order()
+                .unwrap()
+                .map(|(_, doc)| index.store().get(*doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Highest rating first, cheaper first on ties, missing values last.
+        assert_eq!(order(&index), ["c", "b", "a", "d"]);
+        index.add(json!({"objectID": "a", "rating": 9, "price": 1})).unwrap();
+        index.delete("c");
+        assert_eq!(order(&index), ["a", "b", "d"]);
+        assert!(Index::new(Settings::default()).custom_order().is_none());
+    }
 }
+

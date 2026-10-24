@@ -1,5 +1,6 @@
 //! Loads a catalog and runs a query set in-process, reporting indexing time,
-//! memory, latency percentiles and the slowest queries.
+//! memory, latency percentiles and the slowest queries. Each query is timed
+//! as the median of three runs.
 //!
 //! Usage (from the repository root):
 //! `cargo run --release -p engine --example bench_queries -- RECORDS.jsonl SETTINGS.json QUERIES.jsonl`
@@ -62,12 +63,20 @@ fn main() {
     for p in &params {
         let _ = search(&index, p);
     }
+    // Each query's time is the median of 3 runs, so a one-off stall (page
+    // fault, scheduler) does not show up as a slow query.
     let mut timed: Vec<(f64, &SearchParams, u64)> = params
         .iter()
         .map(|p| {
-            let start = Instant::now();
-            let hits = search(&index, p).map(|r| r.nb_hits).unwrap_or(0);
-            (start.elapsed().as_secs_f64() * 1000.0, p, hits)
+            let mut runs = [0.0; 3];
+            let mut hits = 0;
+            for run in &mut runs {
+                let start = Instant::now();
+                hits = search(&index, p).map(|r| r.nb_hits).unwrap_or(0);
+                *run = start.elapsed().as_secs_f64() * 1000.0;
+            }
+            runs.sort_by(f64::total_cmp);
+            (runs[1], p, hits)
         })
         .collect();
     let mut times: Vec<f64> = timed.iter().map(|t| t.0).collect();
@@ -86,6 +95,17 @@ fn main() {
     timed.sort_by(|a, b| b.0.total_cmp(&a.0));
     println!("slowest:");
     for (ms, p, hits) in timed.iter().take(10) {
-        println!("  {ms:>8.2} ms  {hits:>7} hits  {:?}  filters={:?}", p.query, p.filters);
+        // The same query repeated right away, with its data in the CPU cache.
+        let warm = (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                let _ = search(&index, p);
+                start.elapsed().as_secs_f64() * 1000.0
+            })
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "  {ms:>8.2} ms (repeated: {warm:>6.2} ms)  {hits:>7} hits  {:?}  filters={:?} facets={:?}",
+            p.query, p.filters, p.facets
+        );
     }
 }

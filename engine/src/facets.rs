@@ -61,10 +61,24 @@ struct FacetValue {
     docs: RoaringBitmap,
 }
 
+/// One facet attribute. Values get permanent ids; each record keeps the ids
+/// of its values, so counts can be taken record by record when that is
+/// cheaper than one intersection per value.
+#[derive(Debug, Default)]
+struct FacetValues {
+    ids: HashMap<String, u32>,
+    values: Vec<FacetValue>,
+    /// Indexed by DocId.
+    doc_values: Vec<Vec<u32>>,
+}
+
+/// Counting record by record is used when there are fewer than this many
+/// matching records per distinct value.
+const RECORDS_PER_VALUE_FOR_RECORD_COUNTING: u64 = 32;
+
 #[derive(Debug, Default)]
 pub struct FacetIndex {
-    /// attribute -> normalized value -> records
-    attributes: HashMap<String, HashMap<String, FacetValue>>,
+    attributes: HashMap<String, FacetValues>,
 }
 
 /// Text forms of a facet value: strings, numbers and booleans; arrays give
@@ -90,7 +104,7 @@ fn facet_key(value: &str) -> String {
 
 impl FacetIndex {
     pub fn new(attributes: &[FacetAttribute]) -> Self {
-        FacetIndex { attributes: attributes.iter().map(|f| (f.attribute.clone(), HashMap::new())).collect() }
+        FacetIndex { attributes: attributes.iter().map(|f| (f.attribute.clone(), FacetValues::default())).collect() }
     }
 
     pub fn contains(&self, attribute: &str) -> bool {
@@ -98,51 +112,75 @@ impl FacetIndex {
     }
 
     pub fn add(&mut self, id: DocId, doc: &Map<String, Value>) {
-        for (attribute, values) in &mut self.attributes {
+        for (attribute, facet) in &mut self.attributes {
             let Some(value) = doc.get(attribute) else { continue };
+            let mut ids = Vec::new();
             for display in facet_values(value) {
-                let entry = values.entry(facet_key(&display)).or_default();
+                let key = facet_key(&display);
+                let value_id = match facet.ids.get(&key) {
+                    Some(&v) => v,
+                    None => {
+                        let v = facet.values.len() as u32;
+                        facet.ids.insert(key, v);
+                        facet.values.push(FacetValue::default());
+                        v
+                    }
+                };
+                let entry = &mut facet.values[value_id as usize];
                 if entry.docs.is_empty() {
                     entry.display = display;
                 }
                 entry.docs.insert(id);
+                ids.push(value_id);
             }
+            ids.sort_unstable();
+            ids.dedup();
+            if facet.doc_values.len() <= id as usize {
+                facet.doc_values.resize_with(id as usize + 1, Vec::new);
+            }
+            facet.doc_values[id as usize] = ids;
         }
     }
 
-    pub fn remove(&mut self, id: DocId, doc: &Map<String, Value>) {
-        for (attribute, values) in &mut self.attributes {
-            let Some(value) = doc.get(attribute) else { continue };
-            for display in facet_values(value) {
-                let key = facet_key(&display);
-                if let Some(entry) = values.get_mut(&key) {
-                    entry.docs.remove(id);
-                    if entry.docs.is_empty() {
-                        values.remove(&key);
-                    }
-                }
+    pub fn remove(&mut self, id: DocId) {
+        for facet in self.attributes.values_mut() {
+            let Some(ids) = facet.doc_values.get_mut(id as usize) else { continue };
+            for value_id in std::mem::take(ids) {
+                facet.values[value_id as usize].docs.remove(id);
             }
         }
     }
 
     pub fn docs(&self, attribute: &str, value: &str) -> RoaringBitmap {
-        self.attributes
-            .get(attribute)
-            .and_then(|values| values.get(&facet_key(value)))
-            .map(|v| v.docs.clone())
-            .unwrap_or_default()
+        let Some(facet) = self.attributes.get(attribute) else { return RoaringBitmap::new() };
+        facet.ids.get(&facet_key(value)).map(|&v| facet.values[v as usize].docs.clone()).unwrap_or_default()
     }
 
     /// Value counts among `candidates`, most frequent first (ties by value),
     /// at most `limit` values.
     pub fn counts(&self, attribute: &str, candidates: &RoaringBitmap, limit: usize) -> Vec<FacetCount> {
-        let Some(values) = self.attributes.get(attribute) else { return Vec::new() };
-        let mut counts: Vec<FacetCount> = values
-            .values()
-            .filter_map(|v| {
-                let count = v.docs.intersection_len(candidates);
-                (count > 0).then(|| FacetCount { value: v.display.clone(), count })
-            })
+        let Some(facet) = self.attributes.get(attribute) else { return Vec::new() };
+        let few_records = candidates.len() < RECORDS_PER_VALUE_FOR_RECORD_COUNTING * facet.values.len() as u64;
+        let raw: Vec<(u32, u64)> = if few_records {
+            let mut counts = vec![0u64; facet.values.len()];
+            for doc in candidates {
+                for &v in facet.doc_values.get(doc as usize).map_or(&[][..], Vec::as_slice) {
+                    counts[v as usize] += 1;
+                }
+            }
+            counts.into_iter().enumerate().filter(|&(_, c)| c > 0).map(|(v, c)| (v as u32, c)).collect()
+        } else {
+            facet
+                .values
+                .iter()
+                .enumerate()
+                .map(|(v, value)| (v as u32, value.docs.intersection_len(candidates)))
+                .filter(|&(_, c)| c > 0)
+                .collect()
+        };
+        let mut counts: Vec<FacetCount> = raw
+            .into_iter()
+            .map(|(v, count)| FacetCount { value: facet.values[v as usize].display.clone(), count })
             .collect();
         counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
         counts.truncate(limit);
@@ -270,7 +308,7 @@ mod tests {
         assert_eq!(ids(&f.docs("brand", "ELAN")), [0, 1]);
         let counts = f.counts("brand", &(0..3).collect(), 10);
         assert_eq!(counts[0], FacetCount { value: "Élan".into(), count: 2 });
-        f.remove(2, &doc(json!({"brand": "Orbix"})));
+        f.remove(2);
         assert_eq!(f.counts("brand", &(0..3).collect(), 10).len(), 1);
     }
 
@@ -316,4 +354,40 @@ mod tests {
         n.remove(5, &doc(json!({"price": [5, 50]})));
         assert_eq!(ids(&n.docs("price", Included(40.0), Unbounded)), Vec::<u32>::new());
     }
+
+    #[test]
+    fn counting_by_record_and_by_value_agree() {
+        let mut f = FacetIndex::new(&[FacetAttribute::try_from("tag".to_owned()).unwrap()]);
+        let mut seed = 11u64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for id in 0..3000u32 {
+            let tags: Vec<String> = (0..next(4)).map(|_| format!("t{}", next(200))).collect();
+            f.add(id, &doc(json!({ "tag": tags })));
+        }
+        for id in (0..3000).step_by(7) {
+            f.remove(id);
+        }
+        for size in [1u64, 10, 100, 1000, 3000] {
+            let candidates: RoaringBitmap = (0..3000u32).filter(|_| next(3000) < size).collect();
+            // The two strategies, forced: by record (huge threshold) and by value.
+            let facet = &f.attributes["tag"];
+            let by_value: Vec<(String, u64)> = {
+                let mut c: Vec<(String, u64)> = facet
+                    .values
+                    .iter()
+                    .map(|v| (v.display.clone(), v.docs.intersection_len(&candidates)))
+                    .filter(|&(_, n)| n > 0)
+                    .collect();
+                c.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                c
+            };
+            let counted: Vec<(String, u64)> =
+                f.counts("tag", &candidates, usize::MAX).into_iter().map(|c| (c.value, c.count)).collect();
+            assert_eq!(counted, by_value, "candidates {}", candidates.len());
+        }
+    }
 }
+

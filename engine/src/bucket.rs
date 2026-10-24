@@ -14,7 +14,7 @@
 //! The records chosen for the page are then scored by `ranking::rank`, so
 //! the order and `_rankingInfo` are exactly those of the full ranking.
 
-use crate::index::{Hit, Index};
+use crate::index::{CustomKey, Hit, Index, MAX_ORDERED_RULES, ordered};
 use crate::ranking::{Criterion, RankedDoc, TermWords, pair_proximity, rank};
 use crate::search::QueryTerm;
 use crate::store::DocId;
@@ -36,11 +36,14 @@ pub fn rank_page(
         return Vec::new();
     }
     let mut signals = Signals::new(index, terms, boosts);
-    let mut groups: Vec<Vec<DocId>> = vec![candidates.iter().collect()];
+    let mut groups: Vec<RoaringBitmap> = vec![candidates.clone()];
 
     for &criterion in &index.settings().ranking.0 {
         if groups.iter().all(|g| g.len() == 1) {
             break;
+        }
+        if signals.ties_everything(criterion) {
+            continue;
         }
         let mut next = Vec::with_capacity(groups.len());
         let mut count = 0usize;
@@ -48,23 +51,62 @@ pub fn rank_page(
             if count >= needed {
                 break;
             }
-            let size = group.len();
+            let size = group.len() as usize;
             if size == 1 || count + size <= offset {
                 count += size;
                 next.push(group);
                 continue;
             }
-            let keep = (needed - count).min(size);
-            let subgroups = signals.split(criterion, group, keep);
-            count += subgroups.iter().map(Vec::len).sum::<usize>();
-            next.extend(subgroups);
+            let keep = needed - count;
+            for subgroup in signals.split(criterion, group, keep) {
+                count += subgroup.len() as usize;
+                next.push(subgroup);
+            }
         }
         groups = next;
     }
 
-    let page: RoaringBitmap = groups.into_iter().flatten().skip(offset).take(len).collect();
+    // Inside a group every criterion ties, so records go in DocId order.
+    let page: RoaringBitmap = groups.iter().flat_map(|g| g.iter()).skip(offset).take(len).collect();
     // Scoring only the page's records gives the same order as the full ranking.
     rank(index, terms, &page, boosts)
+}
+
+/// Keeps leading subgroups until they hold at least `keep` records; the
+/// rest cannot reach the page.
+fn first_needed(subgroups: impl IntoIterator<Item = RoaringBitmap>, keep: usize) -> Vec<RoaringBitmap> {
+    let mut kept = Vec::new();
+    let mut count = 0usize;
+    for subgroup in subgroups {
+        if count >= keep {
+            break;
+        }
+        if !subgroup.is_empty() {
+            count += subgroup.len() as usize;
+            kept.push(subgroup);
+        }
+    }
+    kept
+}
+
+/// Splits `group` by how many of `sets` contain each record. `ascending`
+/// puts records in fewer sets first. Done with set operations only.
+fn by_count(group: RoaringBitmap, sets: &[&RoaringBitmap], ascending: bool) -> Vec<RoaringBitmap> {
+    // counts[c] = records of the group in exactly c of the sets seen so far.
+    let mut counts: Vec<RoaringBitmap> = vec![group];
+    for set in sets {
+        let mut next = vec![RoaringBitmap::new(); counts.len() + 1];
+        for (c, members) in counts.into_iter().enumerate() {
+            let inside = &members & *set;
+            next[c] |= &members - &inside;
+            next[c + 1] |= inside;
+        }
+        counts = next;
+    }
+    if !ascending {
+        counts.reverse();
+    }
+    counts
 }
 
 /// Per-record criterion values, computed on demand.
@@ -72,12 +114,13 @@ struct Signals<'a> {
     index: &'a Index,
     terms: &'a [QueryTerm],
     boosts: &'a [RoaringBitmap],
-    /// For each term, the records matching it with 0, 1 and 2 typos.
-    typo_sets: Vec<Vec<RoaringBitmap>>,
+    /// For each term, the records whose best match has 0, 1 and 2 typos
+    /// (disjoint sets).
+    typo_levels: Vec<[RoaringBitmap; 3]>,
     /// For each term, the records matching it exactly.
     exact_sets: Vec<RoaringBitmap>,
-    /// For each term, the records matching it in each attribute.
-    attribute_sets: Vec<Vec<RoaringBitmap>>,
+    /// For each attribute, the records in which any term matches there.
+    attribute_sets: Vec<RoaringBitmap>,
     /// Which words each term matches, for reading positions.
     term_words: Vec<TermWords>,
     /// Proximity of records gathered so far.
@@ -86,76 +129,61 @@ struct Signals<'a> {
 
 impl<'a> Signals<'a> {
     fn new(index: &'a Index, terms: &'a [QueryTerm], boosts: &'a [RoaringBitmap]) -> Self {
-        let mut typo_sets = Vec::with_capacity(terms.len());
+        let mut typo_levels = Vec::with_capacity(terms.len());
         let mut exact_sets = Vec::with_capacity(terms.len());
-        let mut attribute_sets = Vec::with_capacity(terms.len());
+        let mut attribute_sets: Vec<RoaringBitmap> = Vec::new();
+        let mut add_attributes = |sets: &[RoaringBitmap]| {
+            if attribute_sets.len() < sets.len() {
+                attribute_sets.resize_with(sets.len(), RoaringBitmap::new);
+            }
+            for (into, docs) in attribute_sets.iter_mut().zip(sets) {
+                *into |= docs;
+            }
+        };
         for term in terms {
-            let mut by_typos = vec![RoaringBitmap::new(); 3];
+            let mut by_typos: [RoaringBitmap; 3] = Default::default();
             let mut exact = RoaringBitmap::new();
-            let mut by_attribute: Vec<RoaringBitmap> = Vec::new();
             // A prefix matched without typos covers every word starting with
             // it: use the precomputed prefix sets instead of thousands of unions.
-            let whole_prefix = term.is_prefix && term.matches.iter().all(|m| m.typos == 0);
-            if term.matches.iter().all(|m| m.typos == 0) {
+            let no_typos = term.matches.iter().all(|m| m.typos == 0);
+            let whole_prefix = term.is_prefix && no_typos;
+            if no_typos {
                 by_typos[0] = term.docs.clone();
             }
             if whole_prefix {
-                by_attribute = index.prefix_docs_by_attribute(&term.text).to_vec();
+                add_attributes(index.prefix_docs_by_attribute(&term.text));
             }
             for m in &term.matches {
                 let Some(postings) = index.word(&m.word) else { continue };
-                if m.typos > 0 {
+                if !no_typos {
                     by_typos[usize::from(m.typos).min(2)] |= &postings.docs;
-                } else if by_typos[0].is_empty() || m.derived {
-                    by_typos[0] |= &postings.docs;
                 }
                 if m.typos == 0 && !m.prefix && !m.derived {
                     exact |= &postings.docs;
                 }
                 if !whole_prefix || m.derived {
-                    if by_attribute.len() < postings.by_attribute.len() {
-                        by_attribute.resize_with(postings.by_attribute.len(), RoaringBitmap::new);
-                    }
-                    for (set, docs) in by_attribute.iter_mut().zip(&postings.by_attribute) {
-                        *set |= docs;
-                    }
+                    add_attributes(&postings.by_attribute);
                 }
             }
-            typo_sets.push(by_typos);
+            // A record counts at its best (lowest) typo level only.
+            let level0 = by_typos[0].clone();
+            by_typos[1] -= &level0;
+            let level1 = by_typos[1].clone();
+            by_typos[2] -= &level0;
+            by_typos[2] -= &level1;
+            typo_levels.push(by_typos);
             exact_sets.push(exact);
-            attribute_sets.push(by_attribute);
         }
         let term_words = if terms.len() >= 2 { terms.iter().map(|t| TermWords::new(index, t)).collect() } else { Vec::new() };
-        Signals { index, terms, boosts, typo_sets, exact_sets, attribute_sets, term_words, proximity: HashMap::new() }
-    }
-
-    fn typos(&self, doc: DocId) -> u64 {
-        self.typo_sets
-            .iter()
-            .filter_map(|levels| levels.iter().position(|set| set.contains(doc)))
-            .map(|t| t as u64)
-            .sum()
-    }
-
-    /// The most important attribute in which any term matches.
-    fn attribute(&self, doc: DocId) -> u64 {
-        self.attribute_sets
-            .iter()
-            .filter_map(|sets| sets.iter().position(|set| set.contains(doc)))
-            .min()
-            .map_or(u64::MAX, |a| a as u64)
-    }
-
-    fn count(sets: impl Iterator<Item = bool>) -> u64 {
-        sets.filter(|&b| b).count() as u64
+        Signals { index, terms, boosts, typo_levels, exact_sets, attribute_sets, term_words, proximity: HashMap::new() }
     }
 
     /// Computes proximity for the records of `group` not seen yet. Needs at
     /// least two terms.
-    fn gather(&mut self, group: &[DocId]) {
+    fn gather(&mut self, group: &RoaringBitmap) {
         let n_terms = self.terms.len();
         let mut row: Vec<Vec<Hit>> = vec![Vec::new(); n_terms];
-        for &doc in group {
+        for doc in group {
             if self.proximity.contains_key(&doc) {
                 continue;
             }
@@ -175,13 +203,11 @@ impl<'a> Signals<'a> {
         }
     }
 
-    /// Splits `group` by `criterion` into ordered subgroups, keeping at
-    /// least `keep` records and every record tied with the last kept.
     /// True when `criterion` gives every candidate the same value, so it
     /// can be skipped without looking at records.
     fn ties_everything(&self, criterion: Criterion) -> bool {
         match criterion {
-            Criterion::Typo => self.typo_sets.iter().all(|levels| levels[1..].iter().all(RoaringBitmap::is_empty)),
+            Criterion::Typo => self.typo_levels.iter().all(|l| l[1].is_empty() && l[2].is_empty()),
             // Candidates match every required term.
             Criterion::Words => self.terms.iter().all(|t| !t.optional),
             Criterion::Filters => self.boosts.is_empty(),
@@ -191,49 +217,112 @@ impl<'a> Signals<'a> {
         }
     }
 
-    fn split(&mut self, criterion: Criterion, group: Vec<DocId>, keep: usize) -> Vec<Vec<DocId>> {
-        if self.ties_everything(criterion) {
-            return vec![group];
-        }
+    /// Splits `group` by `criterion` into ordered subgroups, keeping at
+    /// least `keep` records and every record tied with the last kept.
+    fn split(&mut self, criterion: Criterion, group: RoaringBitmap, keep: usize) -> Vec<RoaringBitmap> {
         match criterion {
-            Criterion::Typo => by_key(group, keep, |d| self.typos(d)),
-            Criterion::Words => by_key(group, keep, |d| u64::MAX - Self::count(self.terms.iter().map(|t| t.docs.contains(d)))),
-            Criterion::Filters => by_key(group, keep, |d| u64::MAX - Self::count(self.boosts.iter().map(|b| b.contains(d)))),
-            Criterion::Exact => {
-                by_key(group, keep, |d| u64::MAX - Self::count(self.exact_sets.iter().map(|s| s.contains(d))))
+            Criterion::Typo => {
+                // totals[s] = records with s typos over the terms seen so far.
+                let mut totals: Vec<RoaringBitmap> = vec![group];
+                for levels in &self.typo_levels {
+                    let mut next = vec![RoaringBitmap::new(); totals.len() + 2];
+                    for (sum, members) in totals.into_iter().enumerate() {
+                        let mut rest = members.clone();
+                        for (k, level) in levels.iter().enumerate() {
+                            let part = &members & level;
+                            rest -= &part;
+                            next[sum + k] |= part;
+                        }
+                        // Records the term does not match add no typos.
+                        next[sum] |= rest;
+                    }
+                    totals = next;
+                }
+                first_needed(totals, keep)
             }
-            Criterion::Attribute => by_key(group, keep, |d| self.attribute(d)),
+            Criterion::Words => {
+                let sets: Vec<&RoaringBitmap> = self.terms.iter().map(|t| &t.docs).collect();
+                first_needed(by_count(group, &sets, false), keep)
+            }
+            Criterion::Filters => {
+                let sets: Vec<&RoaringBitmap> = self.boosts.iter().collect();
+                first_needed(by_count(group, &sets, false), keep)
+            }
+            Criterion::Exact => {
+                let sets: Vec<&RoaringBitmap> = self.exact_sets.iter().collect();
+                first_needed(by_count(group, &sets, false), keep)
+            }
+            Criterion::Attribute => {
+                let mut rest = group;
+                let mut subgroups = Vec::with_capacity(self.attribute_sets.len() + 1);
+                for set in &self.attribute_sets {
+                    let part = &rest & set;
+                    rest -= &part;
+                    subgroups.push(part);
+                }
+                subgroups.push(rest);
+                first_needed(subgroups, keep)
+            }
             Criterion::Proximity => {
                 self.gather(&group);
                 let proximity = &self.proximity;
-                by_key(group, keep, |d| u64::from(proximity[&d]))
+                to_bitmaps(by_key(group.iter().collect(), keep, |d| u64::from(proximity[&d])))
             }
             Criterion::Custom => {
-                let rules = &self.index.settings().custom_ranking;
-                let value = |i: usize, d: DocId| match self.index.custom_value(i, d) {
-                    Some(v) => {
-                        let key = ordered(v);
-                        // Missing values (u64::MAX) sort last either way.
-                        if rules[i].descending { u64::MAX - 1 - key } else { key }
+                let index = self.index;
+                let rules = index.settings().custom_ranking.len();
+                // A large group: walk the index's sorted order and take its
+                // members, instead of sorting the group.
+                if let Some(order) = index.custom_order()
+                    && group.len() * 8 >= index.all_docs_len()
+                {
+                    let mut subgroups: Vec<RoaringBitmap> = Vec::new();
+                    let mut taken = 0usize;
+                    let mut last: Option<&CustomKey> = None;
+                    for (key, doc) in order {
+                        if !group.contains(*doc) {
+                            continue;
+                        }
+                        if last != Some(key) {
+                            if taken >= keep {
+                                break;
+                            }
+                            subgroups.push(RoaringBitmap::new());
+                            last = Some(key);
+                        }
+                        subgroups.last_mut().expect("just pushed").insert(*doc);
+                        taken += 1;
                     }
-                    None => u64::MAX,
-                };
-                if rules.len() <= 4 {
-                    // A fixed-size key avoids an allocation per record.
-                    by_key(group, keep, |d| std::array::from_fn::<u64, 4, _>(|i| if i < rules.len() { value(i, d) } else { 0 }))
-                } else {
-                    by_key(group, keep, |d| (0..rules.len()).map(|i| value(i, d)).collect::<Vec<u64>>())
+                    return subgroups;
                 }
+                let docs: Vec<DocId> = group.iter().collect();
+                to_bitmaps(if rules <= MAX_ORDERED_RULES {
+                    by_key(docs, keep, |d| index.custom_key(d))
+                } else {
+                    by_key(docs, keep, |d| custom_key_long(index, d))
+                })
             }
         }
     }
 }
 
-/// Maps an f64 to a u64 with the same order (below u64::MAX).
-fn ordered(v: f64) -> u64 {
-    let bits = (v + 0.0).to_bits();
-    let key = if bits >> 63 == 1 { !bits } else { bits | (1 << 63) };
-    key.min(u64::MAX - 2)
+/// The custom-ranking key of a record with more rules than a `CustomKey`
+/// holds.
+fn custom_key_long(index: &Index, doc: DocId) -> Vec<u64> {
+    let rules = &index.settings().custom_ranking;
+    (0..rules.len())
+        .map(|i| match index.custom_value(i, doc) {
+            Some(v) => {
+                let key = ordered(v);
+                if rules[i].descending { u64::MAX - 1 - key } else { key }
+            }
+            None => u64::MAX,
+        })
+        .collect()
+}
+
+fn to_bitmaps(groups: Vec<Vec<DocId>>) -> Vec<RoaringBitmap> {
+    groups.into_iter().map(|g| g.into_iter().collect()).collect()
 }
 
 /// Orders `group` by `key` (smaller first, ties by DocId) and splits it into
