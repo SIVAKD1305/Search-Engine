@@ -1,0 +1,6 @@
+{
+  "searchableAttributes": ["name", "brand", "model", "category", "tags", "description"],
+  "attributesForFaceting": ["brand", "category", "color", "in_stock"],
+  "customRanking": ["desc(rating)", "desc(reviews_count)"],
+  "removeWordsIfNoResults": "lastWords"
+}

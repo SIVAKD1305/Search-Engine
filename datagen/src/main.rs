@@ -1,9 +1,15 @@
 //! Generates deterministic sample datasets (products, movies, articles) as JSON Lines.
 //!
 //! Usage: datagen [OUT_DIR] [--products N] [--movies N] [--articles N] [--seed S]
+//!        datagen [OUT_DIR] --catalog N [--seed S]
+//!
+//! `--catalog N` writes only the large catalog (`catalog.jsonl`) and a
+//! query set sampled from it (`catalog-queries.jsonl`); see `catalog.rs`.
 //!
 //! All names are synthetic. The same seed always produces the same files, so
 //! relevance tests can rely on exact records.
+
+mod catalog;
 
 use rand::Rng;
 use rand::SeedableRng;
@@ -113,6 +119,7 @@ struct Args {
     products: usize,
     movies: usize,
     articles: usize,
+    catalog: Option<usize>,
     seed: u64,
 }
 
@@ -122,6 +129,7 @@ fn parse_args() -> Args {
         products: 10_000,
         movies: 5_000,
         articles: 2_000,
+        catalog: None,
         seed: 42,
     };
     let mut it = std::env::args().skip(1);
@@ -136,6 +144,7 @@ fn parse_args() -> Args {
             "--movies" => args.movies = next_num("--movies") as usize,
             "--articles" => args.articles = next_num("--articles") as usize,
             "--seed" => args.seed = next_num("--seed"),
+            "--catalog" => args.catalog = Some(next_num("--catalog") as usize),
             other if !other.starts_with("--") => args.out_dir = PathBuf::from(other),
             other => panic!("unknown flag {other}"),
         }
@@ -272,6 +281,9 @@ fn write_jsonl(
 fn main() -> std::io::Result<()> {
     let args = parse_args();
     fs::create_dir_all(&args.out_dir)?;
+    if let Some(records) = args.catalog {
+        return catalog::write_catalog(&args.out_dir, records, args.seed);
+    }
     // One RNG per dataset, so changing one count does not change the other files.
     let datasets: [(&str, usize, RecordFn); 3] = [
         ("products.jsonl", args.products, product),
