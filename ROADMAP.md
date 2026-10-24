@@ -32,12 +32,19 @@
    ranking by a randomized test. 10k products: empty query 6.7 → 0.34 ms,
    "s" (8,242 hits) 7.7 → 1.0 ms, "h" (4,772 hits) 4.7 → 0.7 ms; memory
    40 → 46 MB.
-2. Load test with a real load generator, and a large dataset (1M records)
-3. Typo speed on big dictionaries; cheaper highlighting
-4. Group commit for single writes; faster startup
-5. Chinese/Japanese word segmentation
-6. Secured API keys and rate limiting
-7. Geo search, facet stats, multi-word synonyms
+2. ✅ Load test and large dataset: `datagen --catalog N`, `bench_queries`,
+   `profile_query`, `loadtest`. Results and findings in
+   [docs/benchmarks.md](docs/benchmarks.md): 1M records index in 506 s, use
+   8.1 GB, p50 10.8 ms, p99 127 ms; about 580 HTTP requests/s at 100k.
+3. Query time at scale: bitmap-level ranking for huge result sets,
+   precomputed custom-ranking order, per-record position lookup for prefixes
+   with many words (findings 1 and 2)
+4. Typo speed on big dictionaries; cheaper highlighting (finding 3)
+5. Indexing speed and memory; group commit for single writes; faster
+   startup (findings 4 and 5)
+6. Chinese/Japanese word segmentation
+7. Secured API keys and rate limiting
+8. Geo search, facet stats, multi-word synonyms
 
 ## Next
 
