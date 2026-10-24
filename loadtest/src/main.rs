@@ -2,6 +2,10 @@
 //!
 //! Usage: loadtest --url http://127.0.0.1:8080 --index NAME --key SEARCH_KEY
 //!                 --queries QUERIES.jsonl [--concurrency 1,4,16,64] [--seconds 10]
+//!        loadtest --write --url ... --index NAME --key ADMIN_KEY [--concurrency ...]
+//!
+//! `--write` sends single-record writes (PUT /1/indexes/NAME/ID) instead of
+//! searches, to measure write throughput.
 //!
 //! For each concurrency level, that many workers send search requests in a
 //! closed loop (each sends its next request when the previous one is
@@ -20,6 +24,7 @@ struct Args {
     queries: String,
     concurrency: Vec<usize>,
     seconds: u64,
+    write: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -30,6 +35,7 @@ fn parse_args() -> Result<Args, String> {
         queries: String::new(),
         concurrency: vec![1, 4, 16, 64],
         seconds: 10,
+        write: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -44,11 +50,12 @@ fn parse_args() -> Result<Args, String> {
                     value()?.split(',').map(|c| c.trim().parse().map_err(|_| "bad --concurrency")).collect::<Result<_, _>>()?
             }
             "--seconds" => args.seconds = value()?.parse().map_err(|_| "bad --seconds")?,
+            "--write" => args.write = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if args.index.is_empty() || args.key.is_empty() || args.queries.is_empty() {
-        return Err("--index, --key and --queries are required".into());
+    if args.index.is_empty() || args.key.is_empty() || (args.queries.is_empty() && !args.write) {
+        return Err("--index and --key are required, and --queries unless --write".into());
     }
     Ok(args)
 }
@@ -62,14 +69,27 @@ struct Sample {
     first_error: Option<String>,
 }
 
-async fn worker(client: reqwest::Client, url: String, key: String, bodies: Arc<Vec<String>>, start: usize, until: Instant) -> Sample {
+/// What a worker sends: searches from the query set, or record writes.
+#[derive(Clone)]
+enum Work {
+    Search { url: String, bodies: Arc<Vec<String>> },
+    Write { base: String, worker: usize },
+}
+
+async fn worker(client: reqwest::Client, work: Work, key: String, start: usize, until: Instant) -> Sample {
     let mut sample = Sample::default();
     let mut i = start;
     while Instant::now() < until {
-        let body = bodies[i % bodies.len()].clone();
+        let request = match &work {
+            Work::Search { url, bodies } => client.post(url).body(bodies[i % bodies.len()].clone()),
+            Work::Write { base, worker } => {
+                let body = format!(r#"{{"name":"Load test record {i}","rating":{}}}"#, i % 5);
+                client.put(format!("{base}/w{worker}-{i}")).body(body)
+            }
+        };
         i += 1;
         let sent = Instant::now();
-        let result = client.post(&url).header("X-Algolia-API-Key", &key).body(body).send().await;
+        let result = request.header("X-Algolia-API-Key", &key).send().await;
         let outcome = match result {
             Ok(response) if response.status().is_success() => response.json::<Value>().await.map_err(|e| e.to_string()),
             Ok(response) => Err(format!("HTTP {}", response.status())),
@@ -78,7 +98,9 @@ async fn worker(client: reqwest::Client, url: String, key: String, bodies: Arc<V
         match outcome {
             Ok(json) => {
                 sample.latencies_us.push(sent.elapsed().as_micros() as u64);
-                sample.server_ms.push(json["processingTimeMS"].as_u64().unwrap_or(0));
+                if let Some(ms) = json["processingTimeMS"].as_u64() {
+                    sample.server_ms.push(ms);
+                }
             }
             Err(e) => {
                 sample.errors += 1;
@@ -99,10 +121,17 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
-    let bodies: Arc<Vec<String>> =
-        Arc::new(std::fs::read_to_string(&args.queries)?.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect());
+    let bodies: Arc<Vec<String>> = if args.write {
+        Arc::new(Vec::new())
+    } else {
+        Arc::new(std::fs::read_to_string(&args.queries)?.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect())
+    };
     let url = format!("{}/1/indexes/{}/query", args.url, args.index);
-    println!("{} queries from {}, {} s per level, POST {url}", bodies.len(), args.queries, args.seconds);
+    if args.write {
+        println!("single-record writes, {} s per level, PUT {}/1/indexes/{}/ID", args.seconds, args.url, args.index);
+    } else {
+        println!("{} queries from {}, {} s per level, POST {url}", bodies.len(), args.queries, args.seconds);
+    }
     println!("{:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>7}", "conc", "req/s", "p50 ms", "p90 ms", "p99 ms", "max ms", "server p50", "errors");
     for &concurrency in &args.concurrency {
         let client = reqwest::Client::builder()
@@ -114,8 +143,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = Instant::now();
         let workers: Vec<_> = (0..concurrency)
             .map(|w| {
-                let start = w * bodies.len() / concurrency.max(1);
-                tokio::spawn(worker(client.clone(), url.clone(), args.key.clone(), bodies.clone(), start, until))
+                let (work, start) = if args.write {
+                    (Work::Write { base: format!("{}/1/indexes/{}", args.url, args.index), worker: w }, 0)
+                } else {
+                    (Work::Search { url: url.clone(), bodies: bodies.clone() }, w * bodies.len() / concurrency.max(1))
+                };
+                tokio::spawn(worker(client.clone(), work, args.key.clone(), start, until))
             })
             .collect();
         let mut all = Sample::default();

@@ -292,6 +292,13 @@ async fn multi_query(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
 
 // ---- writes ----
 
+/// Commits on a blocking thread: waiting for the disk (and for other
+/// writers of a group commit) must not hold up the threads serving searches.
+async fn commit(state: &Arc<AppState>, entry: state::SharedIndex, ops: Vec<Op>) -> Result<(), ApiError> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || state.commit(&entry, ops)).await.expect("commit task")
+}
+
 fn object_id_of(record: &Map<String, Value>) -> Option<String> {
     match record.get("objectID") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -317,7 +324,7 @@ async fn delete_index(State(state): State<Arc<AppState>>, Path(name): Path<Strin
 }
 
 async fn clear_index(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
-    state.commit(&state.index(&name)?, vec![Op::Clear])?;
+    commit(&state, state.index(&name)?, vec![Op::Clear]).await?;
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
@@ -337,7 +344,7 @@ async fn set_settings(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     }
     let settings: Settings =
         serde_json::from_value(merged).map_err(|e| ApiError::bad_request(format!("invalid settings: {e}")))?;
-    state.commit(&entry, vec![Op::Settings(settings)])?;
+    commit(&state, entry, vec![Op::Settings(settings)]).await?;
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
@@ -351,7 +358,7 @@ async fn task_status(State(state): State<Arc<AppState>>, Path((name, _task)): Pa
 async fn add_object(State(state): State<Arc<AppState>>, Path(name): Path<String>, body: Bytes) -> ApiResult {
     let record = json_object(&body)?;
     let object_id = object_id_of(&record).unwrap_or_else(|| state.new_object_id());
-    state.commit(&state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)])?;
+    commit(&state, state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)]).await?;
     Ok(Json(json!({ "createdAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -368,7 +375,7 @@ async fn put_object(
     body: Bytes,
 ) -> ApiResult {
     let record = json_object(&body)?;
-    state.commit(&state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)])?;
+    commit(&state, state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)]).await?;
     Ok(Json(json!({ "updatedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -382,7 +389,7 @@ async fn partial_update(
     let query = params::from_query_string(q.as_deref().unwrap_or(""));
     let create = !query.get("createIfNotExists").is_some_and(|v| v == false);
     let op = Op::Partial { id: object_id.clone(), changes, create };
-    state.commit(&state.index_or_create(&name)?, vec![op])?;
+    commit(&state, state.index_or_create(&name)?, vec![op]).await?;
     Ok(Json(json!({ "updatedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -390,7 +397,7 @@ async fn delete_object(
     State(state): State<Arc<AppState>>,
     Path((name, object_id)): Path<(String, String)>,
 ) -> ApiResult {
-    state.commit(&state.index(&name)?, vec![Op::Delete(object_id.clone())])?;
+    commit(&state, state.index(&name)?, vec![Op::Delete(object_id.clone())]).await?;
     Ok(Json(json!({ "deletedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -431,7 +438,7 @@ async fn batch(State(state): State<Arc<AppState>>, Path(name): Path<String>, bod
         }
         ops.push(op);
     }
-    state.commit(&state.index_or_create(&name)?, ops)?;
+    commit(&state, state.index_or_create(&name)?, ops).await?;
     Ok(Json(json!({ "taskID": state.task(), "objectIDs": object_ids })))
 }
 

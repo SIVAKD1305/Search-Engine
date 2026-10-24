@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
@@ -37,6 +37,22 @@ pub struct WriteLog {
 pub struct IndexEntry {
     pub index: RwLock<Index>,
     log: Mutex<WriteLog>,
+    /// Client writes waiting to be committed together (group commit).
+    queue: Mutex<CommitQueue>,
+    committed: Condvar,
+}
+
+/// Writes that arrive while a commit is running wait here; the next leader
+/// commits all of them with one fsync.
+#[derive(Default)]
+struct CommitQueue {
+    pending: Vec<(u64, Vec<Op>)>,
+    next_ticket: u64,
+    /// Every ticket up to this one has been committed (or has failed).
+    done_through: u64,
+    leader_active: bool,
+    /// Tickets whose commit failed, with the reason.
+    failed: HashMap<u64, String>,
 }
 
 pub type SharedIndex = Arc<IndexEntry>;
@@ -44,7 +60,13 @@ pub type SharedIndex = Arc<IndexEntry>;
 impl IndexEntry {
     fn new(index: Index, store: Option<IndexStore>, seq: u64, epoch: u64, recent: Vec<Logged>) -> SharedIndex {
         let log = WriteLog { store, seq, epoch, recent: recent.into() };
-        Arc::new(IndexEntry { index: RwLock::new(index), log: Mutex::new(log) })
+        let queue = CommitQueue { next_ticket: 1, ..CommitQueue::default() };
+        Arc::new(IndexEntry {
+            index: RwLock::new(index),
+            log: Mutex::new(log),
+            queue: Mutex::new(queue),
+            committed: Condvar::new(),
+        })
     }
 
     /// (sequence number, epoch)
@@ -315,10 +337,52 @@ impl AppState {
         Ok(true)
     }
 
-    /// Applies client changes: numbers them, makes them durable, applies them.
+    /// Applies client changes: numbers them, makes them durable, applies
+    /// them. Blocks until they are on disk.
+    ///
+    /// Group commit: a writer that finds no commit running becomes the
+    /// leader and commits every write queued so far with one fsync; writers
+    /// arriving meanwhile queue up for the next round.
     pub fn commit(&self, entry: &SharedIndex, ops: Vec<Op>) -> Result<(), ApiError> {
         self.ensure_writable()?;
+        let mut queue = entry.queue.lock().unwrap();
+        let ticket = queue.next_ticket;
+        queue.next_ticket += 1;
+        queue.pending.push((ticket, ops));
+        loop {
+            if queue.done_through >= ticket {
+                return match queue.failed.remove(&ticket) {
+                    None => Ok(()),
+                    Some(message) => Err(ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message }),
+                };
+            }
+            if queue.leader_active {
+                queue = entry.committed.wait(queue).unwrap();
+                continue;
+            }
+            queue.leader_active = true;
+            let batch = std::mem::take(&mut queue.pending);
+            drop(queue);
+            let last = batch.last().map_or(0, |(t, _)| *t);
+            let tickets: Vec<u64> = batch.iter().map(|(t, _)| *t).collect();
+            let result = self.commit_batch(entry, batch.into_iter().flat_map(|(_, ops)| ops).collect());
+            queue = entry.queue.lock().unwrap();
+            if let Err(e) = result {
+                for t in tickets {
+                    queue.failed.insert(t, e.message.clone());
+                }
+            }
+            queue.done_through = last;
+            queue.leader_active = false;
+            entry.committed.notify_all();
+        }
+    }
+
+    /// Commits the operations of several requests, in order, as one write.
+    fn commit_batch(&self, entry: &SharedIndex, ops: Vec<Op>) -> Result<(), ApiError> {
         let mut log = entry.log.lock().unwrap();
+        // One resolution for the whole batch, so a request sees the changes
+        // of the requests queued before it.
         let entries = resolve(&entry.index.read().unwrap(), ops);
         let first = log.seq + 1;
         let logged: Vec<Logged> =
@@ -424,6 +488,47 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Barrier;
+
+    #[test]
+    fn concurrent_writes_are_grouped_and_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::open("a".into(), "s".into(), dir.path()).unwrap());
+        let entry = state.index_or_create("group").unwrap();
+        let threads: Vec<_> = (0..16)
+            .map(|t| {
+                let (state, entry) = (state.clone(), entry.clone());
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        let record = json!({"t": t, "i": i}).as_object().unwrap().clone();
+                        state.commit(&entry, vec![Op::Put(format!("{t}-{i}"), record)]).unwrap();
+                        // Every thread also adds its own field to one shared record.
+                        let field = json!({ format!("f{t}"): i }).as_object().unwrap().clone();
+                        let op = Op::Partial { id: "shared".into(), changes: field, create: true };
+                        state.commit(&entry, vec![op]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let check = |index: &Index| {
+            assert_eq!(index.stats().records, 16 * 50 + 1);
+            let shared = index.get_object("shared").unwrap();
+            for t in 0..16 {
+                // No partial update was lost: each thread's last value is there.
+                assert_eq!(shared[&format!("f{t}")], 49, "field f{t}");
+            }
+        };
+        check(&entry.index.read().unwrap());
+        assert_eq!(entry.position().0, 16 * 50 * 2);
+        drop((entry, state));
+        // The log replays to the same state, with contiguous sequence numbers.
+        let reopened = AppState::open("a".into(), "s".into(), dir.path()).unwrap();
+        let entry = reopened.index("group").unwrap();
+        check(&entry.index.read().unwrap());
+        assert_eq!(entry.position().0, 16 * 50 * 2);
+    }
 
     #[test]
     fn deleting_and_recreating_at_once_keeps_the_new_index_files() {
