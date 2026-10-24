@@ -38,6 +38,31 @@ Data is saved in `./search-data` (change with `--data-dir DIR`, or use
 write-ahead log on disk before the server answers, so it survives a crash.
 `--load` replaces an index with the records of a JSONL file.
 
+## API keys
+
+The admin key can do everything; the search key can search. More keys,
+with Algolia's rights and limits, are made with the admin key:
+
+```bash
+curl -H 'X-Algolia-API-Key: my-admin' -X POST http://127.0.0.1:8080/1/keys \
+  -d '{"acl": ["search"], "indexes": ["products"], "maxQueriesPerIPPerHour": 1000}'
+```
+
+A backend can hand each user a **secured key** made from a search key,
+without calling the server, the same way as Algolia's
+`generateSecuredApiKey` (so Algolia client libraries can make them too):
+
+```bash
+cargo run --release -p server -- secured-key SEARCH_KEY \
+  'filters=owner%3A42&validUntil=1767225600&userToken=42'
+```
+
+Its filters always apply on top of the request's, it can only search, and
+it expires at `validUntil`. Past `maxQueriesPerIPPerHour` (counted per
+`userToken` for secured keys) requests get `429` with `Retry-After`. Behind a
+proxy, start the server with `--trust-proxy` so client addresses come from
+`X-Forwarded-For`.
+
 ## Chinese and Japanese
 
 Text without spaces is split into words with a dictionary: jieba for
@@ -78,6 +103,8 @@ milliseconds). It keeps serving searches when the primary is down and catches
 up when it returns. Writes sent to a replica are refused with `403`. Check
 lag with `GET /1/replication/status` (admin key).
 
+Keys made with `/1/keys` can use the endpoints their ACL allows.
+
 | Method | Path | Key |
 |---|---|---|
 | POST | `/1/indexes/{index}/query` | search |
@@ -91,6 +118,8 @@ lag with `GET /1/replication/status` (admin key).
 | GET / PUT / DELETE | `/1/indexes/{index}/{objectID}` | admin |
 | POST | `/1/indexes/{index}/{objectID}/partial` | admin |
 | GET | `/1/indexes/{index}/task/{taskID}` | admin |
+| GET / POST | `/1/keys` | admin |
+| GET / PUT / DELETE | `/1/keys/{key}` | admin |
 | GET | `/1/isalive` | none |
 
 See [ROADMAP.md](ROADMAP.md) for the plan and open items.

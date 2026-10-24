@@ -63,7 +63,14 @@
    voicing marks kept and full-width forms folded. Typed queries (first 2-8
    characters of a product name, 50k records each): 0/300 Japanese and 1/300
    Chinese without results (12 and 11 before the fallbacks).
-7. Secured API keys and rate limiting
+7. ✅ API keys: `/1/keys` with Algolia's ACLs, index patterns, validity,
+   `maxQueriesPerIPPerHour`, `maxHitsPerQuery`, forced `queryParameters`
+   and referers, saved in `keys.json` and copied to replicas; secured API
+   keys with Algolia's HMAC format (`filters`, `validUntil`,
+   `restrictIndices`, `restrictSources`, `userToken`, forced parameters),
+   whose filters are applied as separate conditions so a request cannot
+   lift them; sliding-window rate limits per key and IP (or userToken), and
+   per IP for unknown keys; `server secured-key` to make secured keys.
 8. Geo search, facet stats, multi-word synonyms
 
 ## Next
@@ -93,8 +100,15 @@
 - Server gaps: applying a write holds the index's write lock, so a big batch
   pauses searches on that index while it is applied in memory (the fsync
   itself does not block searches; Algolia runs indexing in a separate
-  process); no secured (HMAC-restricted) API
-  keys, rate limiting, browse/cursor endpoint, or replica indexes yet.
+  process); no browse/cursor endpoint or replica indexes yet.
+- Key gaps: rate limit counters are per server (each replica counts on its
+  own); a key's or secured key's filters are evaluated on every query
+  (a `price < 500` filter over 100k records cost about 20% of throughput;
+  cache the record set per index version); a secured key's parent is found
+  by trying each search key's HMAC once, then cached; `validity` is
+  reported as set, not as time left; no `/1/keys/{key}/restore`; reading
+  records by objectID is refused for keys that force filters or
+  `attributesToRetrieve`.
 - Load test: 2,000 searches with 16 parallel `curl` processes on 4 cores
   gave p50 4.6 ms, p99 27.6 ms, 315 req/s, all 200s. The client (one process
   per request) was the bottleneck; measure again with a real load generator.

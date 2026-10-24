@@ -13,10 +13,13 @@
 //! - `GET /1/replication/indexes/{index}/snapshot` — the whole index.
 //! - `GET /1/replication/wait?version=V` — returns as soon as the change
 //!   counter passes V (long polling), or after a timeout.
+//! - `GET /1/replication/keys` — the API keys made with `/1/keys`, so that
+//!   a replica accepts the same keys (and secured keys made from them).
 //!
-//! A replica repeats: list the indexes; fetch missing changes, or the whole
-//! index when it is new, re-created (other epoch) or too far behind; drop
-//! indexes the primary no longer has; then wait for the next change.
+//! A replica repeats: copy the keys; list the indexes; fetch missing
+//! changes, or the whole index when it is new, re-created (other epoch) or
+//! too far behind; drop indexes the primary no longer has; then wait for the
+//! next change.
 //! Because a replica serves the same endpoints, replicas can be chained.
 
 use crate::state::{AppState, ReplicationError};
@@ -46,6 +49,11 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/1/replication/indexes/{index}/snapshot", get(snapshot))
         .route("/1/replication/wait", get(wait))
         .route("/1/replication/status", get(status))
+        .route("/1/replication/keys", get(keys))
+}
+
+async fn keys(State(state): State<Arc<AppState>>) -> Json<Vec<crate::keys::ApiKey>> {
+    Json(state.keys.list())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -212,6 +220,11 @@ fn record(state: &AppState, error: Option<String>) {
 /// as of the start of the sync.
 async fn sync(state: &Arc<AppState>, primary: &Primary) -> Result<u64, Error> {
     let listing: Listing = primary.json("/1/replication/indexes", Duration::from_secs(30)).await?;
+    // After the listing, so a key change during the sync wakes the next wait.
+    let keys: Vec<crate::keys::ApiKey> = primary.json("/1/replication/keys", Duration::from_secs(30)).await?;
+    if state.keys.replace_all(keys)? {
+        println!("replication: copied {} API key(s)", state.keys.list().len());
+    }
     for remote in &listing.indexes {
         sync_index(state, primary, remote).await?;
         state.replica_status.lock().unwrap().primary_seq.insert(remote.name.clone(), remote.seq);

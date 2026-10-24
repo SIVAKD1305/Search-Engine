@@ -3,12 +3,16 @@
 //!
 //! Keys travel in the `X-Algolia-API-Key` header (or the
 //! `x-algolia-api-key` query parameter). The admin key can do everything;
-//! the search key can only search.
+//! the search key can only search; keys made with `/1/keys` and secured
+//! keys have the rights and restrictions described in `keys`. A key with
+//! `maxQueriesPerIPPerHour` is answered `429` past its limit, and so is a
+//! client address after too many requests with unknown keys.
 //!
 //! Writes are applied before the response is sent, so every returned
 //! `taskID` is already `published`. With a data directory, each write is
 //! first made durable in the index's write-ahead log (see `storage`).
 
+pub mod keys;
 pub mod params;
 pub mod replication;
 pub mod state;
@@ -17,21 +21,22 @@ pub mod storage;
 pub use state::AppState;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, RawQuery, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use engine::index::{Index, Settings};
 use engine::search::{SearchParams, search};
+use keys::{ApiKey, Caller, Grant, KeyRequest};
 use params::ResponseOptions;
 use serde_json::{Map, Value, json};
 use state::Op;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use storage::StorageError;
-use subtle::ConstantTimeEq;
 use tower_http::cors::CorsLayer;
 
 /// Largest accepted request body (batches of records).
@@ -99,11 +104,12 @@ fn rfc3339(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Access {
-    Search,
-    Admin,
-}
+/// Requests with unknown keys allowed per client address per hour, to slow
+/// down guessing.
+pub const MAX_FAILED_AUTH_PER_HOUR: u32 = 1000;
+
+/// The rights of the request's key, set by `authenticate`.
+type Key = Extension<Arc<Grant>>;
 
 fn presented_key<'a>(headers: &'a HeaderMap, query: Option<&'a str>) -> Option<String> {
     if let Some(key) = headers.get("x-algolia-api-key").and_then(|v| v.to_str().ok()) {
@@ -114,58 +120,84 @@ fn presented_key<'a>(headers: &'a HeaderMap, query: Option<&'a str>) -> Option<S
         .map(|(_, v)| v.into_owned())
 }
 
-fn key_matches(presented: &str, expected: &str) -> bool {
-    presented.as_bytes().ct_eq(expected.as_bytes()).into()
+fn caller_of(state: &AppState, request: &Request) -> Caller {
+    let headers = request.headers();
+    let forwarded = || -> Option<IpAddr> {
+        let value = headers.get("x-forwarded-for")?.to_str().ok()?;
+        value.split(',').next()?.trim().parse().ok()
+    };
+    let ip = if state.trust_proxy { forwarded() } else { None }
+        .or_else(|| request.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()));
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    Caller { ip, referer: header("referer").or_else(|| header("origin")) }
 }
 
-async fn require(state: Arc<AppState>, needed: Access, request: Request, next: Next) -> Response {
-    let key = presented_key(request.headers(), request.uri().query());
-    let access = match key.as_deref() {
-        Some(k) if key_matches(k, &state.admin_key) => Some(Access::Admin),
-        Some(k) if key_matches(k, &state.search_key) => Some(Access::Search),
-        _ => None,
-    };
-    match access {
-        None => ApiError { status: StatusCode::FORBIDDEN, message: "Invalid Application-ID or API key".into() }
-            .into_response(),
-        Some(Access::Search) if needed == Access::Admin => {
-            ApiError { status: StatusCode::FORBIDDEN, message: "Method not allowed with this API key".into() }
-                .into_response()
+fn too_many_requests(wait_seconds: u64) -> Response {
+    let mut response =
+        ApiError { status: StatusCode::TOO_MANY_REQUESTS, message: "Too many requests".into() }.into_response();
+    response.headers_mut().insert("retry-after", HeaderValue::from(wait_seconds));
+    response
+}
+
+/// Checks the key of every request, applies rate limits, and passes the
+/// key's rights on to the handler.
+async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
+    let caller = caller_of(&state, &request);
+    let now = keys::unix_now();
+    let failures = format!("unknown-key|{}", caller.ip.map_or_else(|| "unknown".into(), |ip| ip.to_string()));
+    if let Err(wait) = state.limiter.peek(&failures, MAX_FAILED_AUTH_PER_HOUR, now) {
+        return too_many_requests(wait);
+    }
+    let presented = presented_key(request.headers(), request.uri().query());
+    let resolved = presented.and_then(|k| state.keys.resolve(&k, &state.admin_key, &state.search_key, &caller));
+    let grant = match resolved {
+        Some(Ok(grant)) => grant,
+        Some(Err(e)) => return e.into_response(),
+        None => {
+            let _ = state.limiter.hit(&failures, MAX_FAILED_AUTH_PER_HOUR, now);
+            return ApiError { status: StatusCode::FORBIDDEN, message: "Invalid Application-ID or API key".into() }
+                .into_response();
         }
-        Some(_) => next.run(request).await,
+    };
+    if let Some((limit, who)) = &grant.rate_limit
+        && let Err(wait) = state.limiter.hit(who, *limit, now)
+    {
+        return too_many_requests(wait);
+    }
+    request.extensions_mut().insert(Arc::new(grant));
+    next.run(request).await
+}
+
+async fn admin_only(Extension(grant): Key, request: Request, next: Next) -> Response {
+    match grant.require_admin() {
+        Ok(()) => next.run(request).await,
+        Err(e) => e.into_response(),
     }
 }
 
 pub fn app(state: Arc<AppState>) -> Router {
     // Algolia's multi-query path has a literal `*` segment.
-    let search_routes = Router::new()
+    let api = Router::new()
         .without_v07_checks()
         .route("/1/indexes/{index}/query", post(query))
         .route("/1/indexes/*/queries", post(multi_query))
-        .route("/1/indexes/{index}", get(query_get))
-        .route_layer(middleware::from_fn_with_state(state.clone(), |State(s), req, next| {
-            require(s, Access::Search, req, next)
-        }));
-
-    let admin_routes = Router::new()
         .route("/1/indexes", get(list_indexes))
-        .route("/1/indexes/{index}", post(add_object).delete(delete_index))
+        .route("/1/indexes/{index}", get(query_get).post(add_object).delete(delete_index))
         .route("/1/indexes/{index}/batch", post(batch))
         .route("/1/indexes/{index}/clear", post(clear_index))
         .route("/1/indexes/{index}/settings", get(get_settings).put(set_settings))
         .route("/1/indexes/{index}/task/{task}", get(task_status))
         .route("/1/indexes/{index}/{object_id}", get(get_object).put(put_object).delete(delete_object))
         .route("/1/indexes/{index}/{object_id}/partial", post(partial_update))
-        .merge(replication::routes())
-        .route_layer(middleware::from_fn_with_state(state.clone(), |State(s), req, next| {
-            require(s, Access::Admin, req, next)
-        }));
+        .route("/1/keys", get(list_keys).post(create_key))
+        .route("/1/keys/{key}", get(get_key).put(update_key).delete(delete_key))
+        .merge(replication::routes().without_v07_checks().route_layer(middleware::from_fn(admin_only)))
+        .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
 
     Router::new()
         .without_v07_checks()
         .route("/1/isalive", get(|| async { Json(json!({ "message": "server is alive" })) }))
-        .merge(search_routes)
-        .merge(admin_routes)
+        .merge(api)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -254,8 +286,12 @@ fn run_search(index: &Index, params: &SearchParams, options: &ResponseOptions) -
     Ok(response)
 }
 
-fn search_index(state: &AppState, name: &str, map: Map<String, Value>) -> Result<Value, ApiError> {
-    let (params, options) = params::into_search_params(map)?;
+fn search_index(state: &AppState, grant: &Grant, name: &str, mut map: Map<String, Value>) -> Result<Value, ApiError> {
+    grant.require("search", Some(name))?;
+    grant.force_params(&mut map);
+    let (mut params, options) = params::into_search_params(map)?;
+    params.enforced_filters = grant.enforced_filters().to_vec();
+    params.hits_per_page = grant.cap_hits_per_page(params.hits_per_page);
     let entry = state.index(name)?;
     let index = entry.index.read().unwrap();
     let mut response = run_search(&index, &params, &options)?;
@@ -263,18 +299,23 @@ fn search_index(state: &AppState, name: &str, map: Map<String, Value>) -> Result
     Ok(response)
 }
 
-async fn query(State(state): State<Arc<AppState>>, Path(name): Path<String>, body: Bytes) -> ApiResult {
+async fn query(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>, body: Bytes) -> ApiResult {
     let map = params::from_body(&json_body(&body)?)?;
-    Ok(Json(search_index(&state, &name, map)?))
+    Ok(Json(search_index(&state, &grant, &name, map)?))
 }
 
-async fn query_get(State(state): State<Arc<AppState>>, Path(name): Path<String>, RawQuery(q): RawQuery) -> ApiResult {
+async fn query_get(
+    State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
+    Path(name): Path<String>,
+    RawQuery(q): RawQuery,
+) -> ApiResult {
     let mut map = params::from_query_string(q.as_deref().unwrap_or(""));
     map.retain(|k, _| !k.to_ascii_lowercase().starts_with("x-algolia-"));
-    Ok(Json(search_index(&state, &name, map)?))
+    Ok(Json(search_index(&state, &grant, &name, map)?))
 }
 
-async fn multi_query(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult {
+async fn multi_query(State(state): State<Arc<AppState>>, Extension(grant): Key, body: Bytes) -> ApiResult {
     let body = json_object(&body)?;
     let Some(Value::Array(requests)) = body.get("requests") else {
         return Err(ApiError::bad_request("body needs a requests array"));
@@ -285,7 +326,7 @@ async fn multi_query(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
             .get("indexName")
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad_request("every request needs an indexName"))?;
-        results.push(search_index(&state, name, params::from_body(request)?)?);
+        results.push(search_index(&state, &grant, name, params::from_body(request)?)?);
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -309,33 +350,44 @@ fn object_id_of(record: &Map<String, Value>) -> Option<String> {
 
 // ---- indexes and settings ----
 
-async fn list_indexes(State(state): State<Arc<AppState>>) -> ApiResult {
+async fn list_indexes(State(state): State<Arc<AppState>>, Extension(grant): Key) -> ApiResult {
+    grant.require("listIndexes", None)?;
     let items: Vec<Value> = state
         .indexes()
         .iter()
+        .filter(|(name, _)| grant.admin || grant.allows_index(name))
         .map(|(name, entry)| json!({ "name": name, "entries": entry.index.read().unwrap().stats().records }))
         .collect();
     Ok(Json(json!({ "items": items, "nbPages": 1 })))
 }
 
-async fn delete_index(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
+async fn delete_index(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>) -> ApiResult {
+    grant.require("deleteIndex", Some(&name))?;
     state.delete_index(&name)?;
     Ok(Json(json!({ "taskID": state.task(), "deletedAt": now() })))
 }
 
-async fn clear_index(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
+async fn clear_index(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>) -> ApiResult {
+    grant.require("deleteIndex", Some(&name))?;
     commit(&state, state.index(&name)?, vec![Op::Clear]).await?;
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
-async fn get_settings(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
+async fn get_settings(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>) -> ApiResult {
+    grant.require("settings", Some(&name))?;
     let entry = state.index(&name)?;
     let settings = serde_json::to_value(entry.index.read().unwrap().settings()).expect("serializable");
     Ok(Json(settings))
 }
 
 /// Only the given settings change; the others keep their values.
-async fn set_settings(State(state): State<Arc<AppState>>, Path(name): Path<String>, body: Bytes) -> ApiResult {
+async fn set_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    grant.require("editSettings", Some(&name))?;
     let changes = json_object(&body)?;
     let entry = state.index_or_create(&name)?;
     let mut merged = serde_json::to_value(entry.index.read().unwrap().settings()).expect("serializable");
@@ -348,21 +400,41 @@ async fn set_settings(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
-async fn task_status(State(state): State<Arc<AppState>>, Path((name, _task)): Path<(String, u64)>) -> ApiResult {
+async fn task_status(
+    State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
+    Path((name, _task)): Path<(String, u64)>,
+) -> ApiResult {
+    if !grant.admin && !grant.allows_index(&name) {
+        return Err(ApiError { status: StatusCode::FORBIDDEN, message: "Index not allowed with this API key".into() });
+    }
     state.index(&name)?;
     Ok(Json(json!({ "status": "published", "pendingTask": false })))
 }
 
 // ---- records ----
 
-async fn add_object(State(state): State<Arc<AppState>>, Path(name): Path<String>, body: Bytes) -> ApiResult {
+async fn add_object(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>, body: Bytes) -> ApiResult {
+    grant.require("addObject", Some(&name))?;
     let record = json_object(&body)?;
     let object_id = object_id_of(&record).unwrap_or_else(|| state.new_object_id());
     commit(&state, state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)]).await?;
     Ok(Json(json!({ "createdAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
-async fn get_object(State(state): State<Arc<AppState>>, Path((name, object_id)): Path<(String, String)>) -> ApiResult {
+async fn get_object(
+    State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
+    Path((name, object_id)): Path<(String, String)>,
+) -> ApiResult {
+    grant.require("search", Some(&name))?;
+    if grant.restricts_records() {
+        // The key's filters or hidden attributes apply to searches only.
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "Reading records by objectID is not allowed with this API key".into(),
+        });
+    }
     let entry = state.index(&name)?;
     let index = entry.index.read().unwrap();
     let record = index.get_object(&object_id).ok_or_else(|| ApiError::not_found("ObjectID does not exist"))?;
@@ -371,9 +443,11 @@ async fn get_object(State(state): State<Arc<AppState>>, Path((name, object_id)):
 
 async fn put_object(
     State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
     Path((name, object_id)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult {
+    grant.require("addObject", Some(&name))?;
     let record = json_object(&body)?;
     commit(&state, state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)]).await?;
     Ok(Json(json!({ "updatedAt": now(), "taskID": state.task(), "objectID": object_id })))
@@ -381,10 +455,12 @@ async fn put_object(
 
 async fn partial_update(
     State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
     Path((name, object_id)): Path<(String, String)>,
     RawQuery(q): RawQuery,
     body: Bytes,
 ) -> ApiResult {
+    grant.require("addObject", Some(&name))?;
     let changes = json_object(&body)?;
     let query = params::from_query_string(q.as_deref().unwrap_or(""));
     let create = !query.get("createIfNotExists").is_some_and(|v| v == false);
@@ -395,15 +471,17 @@ async fn partial_update(
 
 async fn delete_object(
     State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
     Path((name, object_id)): Path<(String, String)>,
 ) -> ApiResult {
+    grant.require("deleteObject", Some(&name))?;
     commit(&state, state.index(&name)?, vec![Op::Delete(object_id.clone())]).await?;
     Ok(Json(json!({ "deletedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
 /// Algolia's batch actions. The whole batch is validated before anything is
 /// written, and it is logged as one unit, so a bad request changes nothing.
-async fn batch(State(state): State<Arc<AppState>>, Path(name): Path<String>, body: Bytes) -> ApiResult {
+async fn batch(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>, body: Bytes) -> ApiResult {
     let body = json_object(&body)?;
     let Some(Value::Array(requests)) = body.get("requests") else {
         return Err(ApiError::bad_request("body needs a requests array"));
@@ -432,6 +510,12 @@ async fn batch(State(state): State<Arc<AppState>>, Path(name): Path<String>, bod
             "clear" => Op::Clear,
             other => return Err(fail(&format!("unknown action {other:?}"))),
         };
+        let acl = match &op {
+            Op::Put(..) | Op::Partial { .. } => "addObject",
+            Op::Delete(_) => "deleteObject",
+            Op::Clear | Op::Settings(_) => "deleteIndex",
+        };
+        grant.require(acl, Some(&name))?;
         match &op {
             Op::Put(id, _) | Op::Partial { id, .. } | Op::Delete(id) => object_ids.push(id.clone()),
             Op::Clear | Op::Settings(_) => {}
@@ -440,6 +524,78 @@ async fn batch(State(state): State<Arc<AppState>>, Path(name): Path<String>, bod
     }
     commit(&state, state.index_or_create(&name)?, ops).await?;
     Ok(Json(json!({ "taskID": state.task(), "objectIDs": object_ids })))
+}
+
+// ---- API keys (admin key only) ----
+
+fn key_storage_error(e: std::io::Error) -> ApiError {
+    ApiError::storage(StorageError::Io(e))
+}
+
+async fn list_keys(State(state): State<Arc<AppState>>, Extension(grant): Key) -> ApiResult {
+    grant.require_admin()?;
+    Ok(Json(json!({ "keys": state.keys.list() })))
+}
+
+async fn create_key(State(state): State<Arc<AppState>>, Extension(grant): Key, body: Bytes) -> ApiResult {
+    grant.require_admin()?;
+    state.ensure_writable()?;
+    let request: KeyRequest = serde_json::from_value(Value::Object(json_object(&body)?))
+        .map_err(|e| ApiError::bad_request(format!("invalid key: {e}")))?;
+    let mut key = ApiKey {
+        value: keys::new_key_value(),
+        acl: Vec::new(),
+        description: String::new(),
+        indexes: Vec::new(),
+        max_hits_per_query: 0,
+        max_queries_per_ip_per_hour: 0,
+        query_parameters: String::new(),
+        referers: Vec::new(),
+        validity: 0,
+        created_at: keys::unix_now(),
+    };
+    request.apply(&mut key)?;
+    let value = key.value.clone();
+    state.keys.put(key).map_err(key_storage_error)?;
+    state.changed();
+    Ok(Json(json!({ "key": value, "createdAt": now() })))
+}
+
+fn stored_key(state: &AppState, value: &str) -> Result<ApiKey, ApiError> {
+    state.keys.get(value).ok_or_else(|| ApiError::not_found("Key does not exist"))
+}
+
+async fn get_key(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(value): Path<String>) -> ApiResult {
+    grant.require_admin()?;
+    Ok(Json(serde_json::to_value(stored_key(&state, &value)?).expect("serializable")))
+}
+
+/// Only the given fields change.
+async fn update_key(
+    State(state): State<Arc<AppState>>,
+    Extension(grant): Key,
+    Path(value): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    grant.require_admin()?;
+    state.ensure_writable()?;
+    let request: KeyRequest = serde_json::from_value(Value::Object(json_object(&body)?))
+        .map_err(|e| ApiError::bad_request(format!("invalid key: {e}")))?;
+    let mut key = stored_key(&state, &value)?;
+    request.apply(&mut key)?;
+    state.keys.put(key).map_err(key_storage_error)?;
+    state.changed();
+    Ok(Json(json!({ "key": value, "updatedAt": now() })))
+}
+
+async fn delete_key(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(value): Path<String>) -> ApiResult {
+    grant.require_admin()?;
+    state.ensure_writable()?;
+    if !state.keys.remove(&value).map_err(key_storage_error)? {
+        return Err(ApiError::not_found("Key does not exist"));
+    }
+    state.changed();
+    Ok(Json(json!({ "deletedAt": now() })))
 }
 
 #[cfg(test)]

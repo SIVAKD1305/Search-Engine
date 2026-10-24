@@ -2,7 +2,8 @@
 //!
 //! Usage: server [--host 127.0.0.1] [--port 8080] [--data-dir DIR | --in-memory]
 //!               [--load NAME=records.jsonl[,settings.json]]...
-//!               [--replica-of PRIMARY_URL]
+//!               [--replica-of PRIMARY_URL] [--trust-proxy]
+//!        server secured-key PARENT_KEY 'filters=...&validUntil=...'
 //!
 //! Data is kept in DIR (default `./search-data`) and reloaded at startup.
 //! `--load` replaces that index with the file's records.
@@ -14,6 +15,11 @@
 //! follows its changes and refuses client writes. It authenticates with the
 //! primary's admin key from SEARCH_PRIMARY_ADMIN_KEY (default: its own
 //! admin key).
+//!
+//! `--trust-proxy` takes client addresses (for rate limits and
+//! `restrictSources`) from `X-Forwarded-For`; use it only behind a proxy
+//! that sets that header. `secured-key` prints a secured API key, as
+//! Algolia's `generateSecuredApiKey` would.
 
 use engine::index::{Index, Settings};
 use rand::RngCore;
@@ -62,7 +68,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut loads = Vec::new();
     let mut data_dir = Some(PathBuf::from("search-data"));
     let mut replica_of: Option<String> = None;
-    let mut args = std::env::args().skip(1);
+    let mut trust_proxy = false;
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("secured-key") {
+        let (Some(parent), Some(params)) = (args.nth(1), args.next()) else {
+            return Err("usage: server secured-key PARENT_KEY 'filters=...&validUntil=...'".into());
+        };
+        println!("{}", server::keys::generate_secured_key(&parent, &params));
+        return Ok(());
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--host" => host = args.next().ok_or("--host needs a value")?,
@@ -71,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--data-dir" => data_dir = Some(args.next().ok_or("--data-dir needs a value")?.into()),
             "--in-memory" => data_dir = None,
             "--replica-of" => replica_of = Some(args.next().ok_or("--replica-of needs the primary's URL")?),
+            "--trust-proxy" => trust_proxy = true,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -117,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => state,
     };
-    let state = Arc::new(state);
+    let state = Arc::new(state.trusting_proxy(trust_proxy));
     if replica_of.is_some() {
         tokio::spawn(run_replica(state.clone(), primary_key));
     }
@@ -128,7 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     println!("listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, app(state.clone())).with_graceful_shutdown(shutdown_signal()).await?;
+    let service = app(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
     if data_dir.is_some() {
         let start = Instant::now();
         state.checkpoint()?;

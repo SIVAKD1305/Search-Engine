@@ -26,16 +26,40 @@ impl Client {
     }
 
     async fn call(&self, method: Method, path: &str, key: Option<&str>, body: Option<Value>) -> (StatusCode, Value) {
+        let (status, json, _) = self.call_from(method, path, key, body, None, &[]).await;
+        (status, json)
+    }
+
+    /// A request from client address `ip`, with extra headers; also returns
+    /// the response headers.
+    async fn call_from(
+        &self,
+        method: Method,
+        path: &str,
+        key: Option<&str>,
+        body: Option<Value>,
+        ip: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value, axum::http::HeaderMap) {
         let mut request = Request::builder().method(method).uri(path);
         if let Some(key) = key {
             request = request.header("X-Algolia-API-Key", key);
         }
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         let body = body.map_or(Body::empty(), |b| Body::from(b.to_string()));
-        let response = self.router.clone().oneshot(request.body(body).unwrap()).await.unwrap();
+        let mut request = request.body(body).unwrap();
+        if let Some(ip) = ip {
+            let addr: std::net::SocketAddr = format!("{ip}:5000").parse().unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        }
+        let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
-        (status, json)
+        (status, json, headers)
     }
 
     async fn admin(&self, method: Method, path: &str, body: Option<Value>) -> Value {
@@ -362,4 +386,212 @@ async fn japanese_index_over_http_and_after_a_restart() {
     assert_eq!(response["hits"][0]["_highlightResult"]["name"]["value"], "関西国際<em>空港</em>限定トートバッグ");
     // Kanji only, split as Japanese (電子 + 辞書) because of indexLanguages.
     assert_eq!(ids(&client.search("shop", json!({"query": "辞書"})).await), ["2"]);
+}
+
+
+/// Creates a key and returns its value.
+async fn create_key(client: &Client, definition: Value) -> String {
+    let created = client.admin(Method::POST, "/1/keys", Some(definition)).await;
+    created["key"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn keys_are_created_listed_updated_and_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = Client::persistent(dir.path());
+    let value = create_key(&client, json!({"acl": ["search"], "description": "web", "indexes": ["dev_*"]})).await;
+    assert_eq!(value.len(), 32);
+    let key = client.admin(Method::GET, &format!("/1/keys/{value}"), None).await;
+    assert_eq!((key["acl"].clone(), key["indexes"].clone()), (json!(["search"]), json!(["dev_*"])));
+    client.admin(Method::PUT, &format!("/1/keys/{value}"), Some(json!({"maxHitsPerQuery": 5}))).await;
+    drop(client);
+
+    // Keys survive a restart.
+    let client = Client::persistent(dir.path());
+    let listed = client.admin(Method::GET, "/1/keys", None).await;
+    assert_eq!(listed["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["keys"][0]["maxHitsPerQuery"], 5);
+    assert_eq!(listed["keys"][0]["description"], "web");
+
+    // Only the admin key manages keys, and bad definitions are refused.
+    let (status, _) = client.call(Method::GET, "/1/keys", Some(SEARCH), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = client.call(Method::GET, "/1/keys", Some(&value), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for bad in [json!({"acl": ["serch"]}), json!({"acl": []}), json!({"acl": ["search"], "colour": 1})] {
+        let (status, _) = client.call(Method::POST, "/1/keys", Some(ADMIN), Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    client.admin(Method::DELETE, &format!("/1/keys/{value}"), None).await;
+    let (status, _) = client.call(Method::GET, &format!("/1/keys/{value}"), Some(ADMIN), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = client.call(Method::POST, "/1/indexes/dev_a/query", Some(&value), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn key_rights_and_index_patterns_are_enforced() {
+    let client = Client::new();
+    client.seed().await;
+    let writer = create_key(&client, json!({"acl": ["addObject"], "indexes": ["dev_*"]})).await;
+    let put = |index: &str| format!("/1/indexes/{index}/1");
+    let (status, _) = client.call(Method::PUT, &put("dev_products"), Some(&writer), Some(json!({"name": "x"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, json) = client.call(Method::PUT, &put("products"), Some(&writer), Some(json!({"name": "x"}))).await;
+    assert_eq!((status, json["message"].as_str().unwrap()), (StatusCode::FORBIDDEN, "Index not allowed with this API key"));
+    // No search, delete or settings rights.
+    for (method, path) in [
+        (Method::POST, "/1/indexes/dev_products/query"),
+        (Method::DELETE, "/1/indexes/dev_products/1"),
+        (Method::DELETE, "/1/indexes/dev_products"),
+        (Method::PUT, "/1/indexes/dev_products/settings"),
+        (Method::GET, "/1/indexes"),
+    ] {
+        let (status, _) = client.call(method.clone(), path, Some(&writer), Some(json!({}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    // Batches are checked action by action.
+    let batch = json!({"requests": [{"action": "addObject", "body": {"name": "y"}}, {"action": "deleteObject", "body": {"objectID": "1"}}]});
+    let (status, _) = client.call(Method::POST, "/1/indexes/dev_products/batch", Some(&writer), Some(batch)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(client.admin(Method::GET, "/1/indexes/dev_products/1", None).await["name"], "x");
+
+    // Listing shows only the allowed indexes.
+    let lister = create_key(&client, json!({"acl": ["listIndexes"], "indexes": ["dev_*"]})).await;
+    let (_, listing) = client.call(Method::GET, "/1/indexes", Some(&lister), None).await;
+    let names: Vec<&str> = listing["items"].as_array().unwrap().iter().map(|i| i["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["dev_products"]);
+}
+
+#[tokio::test]
+async fn secured_keys_restrict_searches() {
+    let client = Client::new();
+    client.seed().await;
+    let secured = server::keys::generate_secured_key(SEARCH, "filters=brand%3A%C3%89lan&restrictIndices=products&hitsPerPage=1");
+    let search = |body: Value| client.call(Method::POST, "/1/indexes/products/query", Some(&secured), Some(body));
+
+    let (status, response) = search(json!({"query": ""})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["nbHits"], 2); // the two Élan records
+    assert_eq!(response["hitsPerPage"], 1); // forced by the key
+    // The request's filters narrow further but cannot widen.
+    let (_, response) = search(json!({"filters": "brand:Orbix"})).await;
+    assert_eq!(response["nbHits"], 0);
+    let (_, response) = search(json!({"filters": "brand:Orbix OR brand:Élan", "hitsPerPage": 50})).await;
+    assert_eq!((response["nbHits"].clone(), response["hitsPerPage"].clone()), (json!(2), json!(1)));
+    let (status, _) = search(json!({"filters": "brand:x) OR (brand:Orbix"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Other indexes, records by objectID, and writes are refused.
+    let (status, _) = client.call(Method::POST, "/1/indexes/other/query", Some(&secured), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = client.call(Method::GET, "/1/indexes/products/2", Some(&secured), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = client.call(Method::PUT, "/1/indexes/products/9", Some(&secured), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Multi-queries are checked per index.
+    let multi = json!({"requests": [{"indexName": "products"}, {"indexName": "other"}]});
+    let (status, _) = client.call(Method::POST, "/1/indexes/*/queries", Some(&secured), Some(multi)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Expired, or signed with something other than a search key.
+    let expired = server::keys::generate_secured_key(SEARCH, "validUntil=1000");
+    let (status, json) = client.call(Method::POST, "/1/indexes/products/query", Some(&expired), Some(json!({}))).await;
+    assert_eq!((status, json["message"].as_str().unwrap()), (StatusCode::FORBIDDEN, "The API key has expired"));
+    let forged = server::keys::generate_secured_key(ADMIN, "filters=brand%3AOrbix");
+    let (status, _) = client.call(Method::POST, "/1/indexes/products/query", Some(&forged), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn secured_keys_inherit_a_created_parents_limits() {
+    let client = Client::new();
+    client.seed().await;
+    let parent = create_key(&client, json!({"acl": ["search", "addObject"], "indexes": ["products"], "queryParameters": "filters=price%20%3C%2050"})).await;
+    let secured = server::keys::generate_secured_key(&parent, "filters=brand%3A%C3%89lan");
+    let (status, response) =
+        client.call(Method::POST, "/1/indexes/products/query", Some(&secured), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    // Both filters apply: Élan and under 50 is only the kettle.
+    assert_eq!(ids(&response), ["3"]);
+    // The parent may write; the secured key may not.
+    let (status, _) = client.call(Method::PUT, "/1/indexes/products/9", Some(&secured), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Deleting the parent invalidates its secured keys.
+    client.admin(Method::DELETE, &format!("/1/keys/{parent}"), None).await;
+    let (status, _) = client.call(Method::POST, "/1/indexes/products/query", Some(&secured), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rate_limits_per_ip_and_per_user_token() {
+    let client = Client::new();
+    client.seed().await;
+    let limited = create_key(&client, json!({"acl": ["search"], "maxQueriesPerIPPerHour": 3})).await;
+    let client = &client;
+    let query = |key: String, ip: &'static str| async move {
+        let path = "/1/indexes/products/query";
+        client.call_from(Method::POST, path, Some(&key), Some(json!({})), Some(ip), &[]).await
+    };
+    for _ in 0..3 {
+        assert_eq!(query(limited.clone(), "10.0.0.1").await.0, StatusCode::OK);
+    }
+    let (status, json, headers) = query(limited.clone(), "10.0.0.1").await;
+    assert_eq!((status, json["message"].as_str().unwrap()), (StatusCode::TOO_MANY_REQUESTS, "Too many requests"));
+    let wait: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((1..=3600).contains(&wait));
+    // Another address has its own count.
+    assert_eq!(query(limited.clone(), "10.0.0.2").await.0, StatusCode::OK);
+    // Secured keys with a userToken are counted per user, even from one address.
+    for user in ["alice", "bob"] {
+        let secured = server::keys::generate_secured_key(&limited, &format!("userToken={user}"));
+        for _ in 0..3 {
+            assert_eq!(query(secured.clone(), "10.0.0.1").await.0, StatusCode::OK);
+        }
+        assert_eq!(query(secured, "10.0.0.1").await.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+    // Keys without a limit are not limited.
+    for _ in 0..10 {
+        assert_eq!(query(SEARCH.to_owned(), "10.0.0.1").await.0, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn guessing_keys_is_slowed_down() {
+    let client = Client::new();
+    client.seed().await;
+    let path = "/1/indexes/products/query";
+    for i in 0..server::MAX_FAILED_AUTH_PER_HOUR {
+        let key = format!("guess-{i}");
+        let (status, _, _) = client.call_from(Method::POST, path, Some(&key), Some(json!({})), Some("10.9.9.9"), &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    // Now even a correct key from that address waits; others are unaffected.
+    let (status, _, _) = client.call_from(Method::POST, path, Some(SEARCH), Some(json!({})), Some("10.9.9.9"), &[]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let (status, _, _) = client.call_from(Method::POST, path, Some(SEARCH), Some(json!({})), Some("10.9.9.8"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sources_and_referers_restrict_keys() {
+    let client = Client::new();
+    client.seed().await;
+    let path = "/1/indexes/products/query";
+    let office = server::keys::generate_secured_key(SEARCH, "restrictSources=192.168.0.0%2F16");
+    let from = |ip| client.call_from(Method::POST, path, Some(&office), Some(json!({})), Some(ip), &[]);
+    assert_eq!(from("192.168.4.4").await.0, StatusCode::OK);
+    assert_eq!(from("8.8.8.8").await.0, StatusCode::FORBIDDEN);
+
+    let web = create_key(&client, json!({"acl": ["search"], "referers": ["https://shop.example.com/*"]})).await;
+    let client = &client;
+    let with = |headers: &'static [(&'static str, &'static str)]| {
+        let web = web.clone();
+        async move { client.call_from(Method::POST, path, Some(&web), Some(json!({})), None, headers).await.0 }
+    };
+    assert_eq!(with(&[("referer", "https://shop.example.com/cart")]).await, StatusCode::OK);
+    assert_eq!(with(&[("origin", "https://shop.example.com/")]).await, StatusCode::OK);
+    assert_eq!(with(&[("referer", "https://other.example.com/")]).await, StatusCode::FORBIDDEN);
+    assert_eq!(with(&[]).await, StatusCode::FORBIDDEN);
 }

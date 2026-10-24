@@ -275,3 +275,31 @@ async fn replica_keeps_serving_while_the_primary_is_down() {
     p.kill();
     r.kill();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_keys_reach_replicas() {
+    let (pdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let p = primary(pdir.path(), 1000, 0).await;
+    seed(&p).await;
+    let r = replica(rdir.path(), &p.url).await;
+    let (status, created) = call(reqwest::Method::POST, format!("{}/1/keys", p.url), ADMIN, Some(json!({"acl": ["search"]}))).await;
+    assert_eq!(status, 200, "{created}");
+    let key = created["key"].as_str().unwrap().to_owned();
+    let secured = server::keys::generate_secured_key(&key, "filters=brand%3AOrbix");
+    let status_on = |node: &Node, key: String| {
+        let url = format!("{}/1/indexes/products/query", node.url);
+        async move { call(reqwest::Method::POST, url, &key, Some(json!({}))).await.0 }
+    };
+    eventually("the key works on the replica", || async { status_on(&r, key.clone()).await == 200 }).await;
+    assert_eq!(status_on(&r, secured.clone()).await, 200);
+    // Key changes are refused on a replica.
+    let (status, _) = call(reqwest::Method::POST, format!("{}/1/keys", r.url), ADMIN, Some(json!({"acl": ["search"]}))).await;
+    assert_eq!(status, 403);
+    // A deleted key stops working on the replica too.
+    let (status, _) = call(reqwest::Method::DELETE, format!("{}/1/keys/{key}", p.url), ADMIN, None).await;
+    assert_eq!(status, 200);
+    eventually("the key is gone from the replica", || async { status_on(&r, key.clone()).await == 403 }).await;
+    assert_eq!(status_on(&r, secured).await, 403);
+    r.kill();
+    p.kill();
+}

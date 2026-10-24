@@ -8,6 +8,7 @@
 //! index (`install_index`).
 
 use crate::ApiError;
+use crate::keys::{KeyStore, RateLimiter};
 use crate::storage::{self, Entry, IndexStore, Logged, SnapshotData, StorageError};
 use axum::http::StatusCode;
 use engine::index::{Index, Settings};
@@ -174,6 +175,11 @@ pub struct AppState {
     data_dir: Option<PathBuf>,
     pub(crate) admin_key: String,
     pub(crate) search_key: String,
+    /// Keys created with `/1/keys`.
+    pub keys: KeyStore,
+    pub(crate) limiter: RateLimiter,
+    /// Take the client address from `X-Forwarded-For` (behind a proxy).
+    pub(crate) trust_proxy: bool,
     next_task: AtomicU64,
     next_object: AtomicU64,
     /// Counts every change on any index; replicas wait for it to move.
@@ -194,6 +200,9 @@ impl AppState {
             data_dir: None,
             admin_key,
             search_key,
+            keys: KeyStore::in_memory(),
+            limiter: RateLimiter::default(),
+            trust_proxy: false,
             next_task: AtomicU64::new(1),
             next_object: AtomicU64::new(1),
             changes: watch::channel(0).0,
@@ -207,6 +216,8 @@ impl AppState {
     pub fn open(admin_key: String, search_key: String, dir: &Path) -> Result<Self, StorageError> {
         let mut state = AppState::new(admin_key, search_key);
         state.data_dir = Some(dir.to_owned());
+        std::fs::create_dir_all(dir)?;
+        state.keys = KeyStore::open(dir.join("keys.json"))?;
         for (name, loaded) in storage::open_all(dir)? {
             let entry = IndexEntry::new(loaded.index, Some(loaded.store), loaded.seq, loaded.epoch, loaded.recent);
             state.indexes.get_mut().unwrap().insert(name, entry);
@@ -217,6 +228,13 @@ impl AppState {
     /// Makes this server a read replica of `primary_url`.
     pub fn as_replica_of(mut self, primary_url: impl Into<String>) -> Self {
         self.primary = Some(primary_url.into().trim_end_matches('/').to_owned());
+        self
+    }
+
+    /// Trust `X-Forwarded-For` for the client address (rate limits,
+    /// `restrictSources`); only behind a proxy that sets it.
+    pub fn trusting_proxy(mut self, trust: bool) -> Self {
+        self.trust_proxy = trust;
         self
     }
 
@@ -252,7 +270,7 @@ impl AppState {
     }
 
     /// Replicas only accept changes from their primary.
-    fn ensure_writable(&self) -> Result<(), ApiError> {
+    pub(crate) fn ensure_writable(&self) -> Result<(), ApiError> {
         match &self.primary {
             None => Ok(()),
             Some(primary) => Err(ApiError {
@@ -478,7 +496,7 @@ impl AppState {
         Ok(bytes)
     }
 
-    fn changed(&self) {
+    pub(crate) fn changed(&self) {
         self.changes.send_modify(|v| *v += 1);
     }
 

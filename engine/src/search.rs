@@ -260,6 +260,11 @@ pub struct SearchParams {
     pub query: String,
     /// Required conditions, in Algolia's `filters` syntax.
     pub filters: Option<String>,
+    /// More required conditions, each parsed on its own and combined with
+    /// `filters` by AND, so no `filters` text can lift them. Set by the
+    /// server from API key restrictions; never read from a request.
+    #[serde(skip)]
+    pub enforced_filters: Vec<String>,
     /// Conditions that boost records matching them, without excluding others.
     pub optional_filters: Vec<String>,
     /// Facet attributes to count; `"*"` means all of them.
@@ -303,6 +308,7 @@ impl Default for SearchParams {
         SearchParams {
             query: String::new(),
             filters: None,
+            enforced_filters: Vec::new(),
             optional_filters: Vec::new(),
             facets: Vec::new(),
             page: 0,
@@ -360,10 +366,14 @@ pub fn search(index: &Index, params: &SearchParams) -> Result<SearchResults, Fil
     let hits_per_page = params.hits_per_page.max(1);
     let options = QueryOptions::for_request(index.settings(), params);
     let mut terms = plan_with(index, &params.query, &options);
-    let filtered = match params.filters.as_deref().filter(|f| !f.trim().is_empty()) {
-        Some(filters) => Some(filter::parse(filters)?.evaluate(index)?),
-        None => None,
-    };
+    let mut filtered: Option<RoaringBitmap> = None;
+    for filters in params.filters.iter().chain(&params.enforced_filters).filter(|f| !f.trim().is_empty()) {
+        let docs = filter::parse(filters)?.evaluate(index)?;
+        filtered = Some(match filtered {
+            Some(f) => f & docs,
+            None => docs,
+        });
+    }
     let apply_filters = |mut docs: RoaringBitmap| {
         if let Some(f) = &filtered {
             docs &= f;
@@ -653,6 +663,28 @@ mod tests {
         // A non-facet numeric attribute can be matched with ':' too.
         assert_eq!(found(&index, "", "price:80"), ["2"]);
         assert_eq!(found(&index, "kettle", "  "), ["2", "1", "3"]);
+    }
+
+    #[test]
+    fn enforced_filters_cannot_be_lifted_by_the_request() {
+        let index = shop();
+        let ids = |filters: Option<&str>| -> Result<Vec<String>, FilterError> {
+            let params = SearchParams {
+                filters: filters.map(Into::into),
+                enforced_filters: vec!["brand:Orbix".into()],
+                ..SearchParams::new("")
+            };
+            Ok(search(&index, &params)?
+                .hits
+                .iter()
+                .map(|h| index.store().get(h.doc).unwrap()["objectID"].as_str().unwrap().to_owned())
+                .collect())
+        };
+        assert_eq!(ids(None).unwrap(), ["2"]);
+        assert_eq!(ids(Some("brand:Élan OR brand:Orbix")).unwrap(), ["2"]);
+        assert!(ids(Some("brand:Élan")).unwrap().is_empty());
+        // Text that would escape a filter joined into one string with AND.
+        assert!(ids(Some("brand:Élan) OR (brand:Élan")).is_err());
     }
 
     #[test]
