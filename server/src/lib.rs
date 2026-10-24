@@ -14,6 +14,7 @@
 
 pub mod keys;
 pub mod params;
+pub mod raft;
 pub mod replication;
 pub mod state;
 pub mod storage;
