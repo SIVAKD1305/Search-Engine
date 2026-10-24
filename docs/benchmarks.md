@@ -104,6 +104,22 @@ has numeric attributes scanned a whole bucket of the range-filter index
 (2.56 ms per update at 100k records); it now takes 0.18 ms, as adding one
 does, standalone too.
 
+### Snapshot restores (11c)
+
+Same cluster. Cluster snapshots now carry index images.
+
+| | Before | After |
+|---|---|---|
+| Node restart (load the snapshot) | 12.8-17.5 s | 0.53-0.78 s |
+| Follower 31,000 entries behind: restart and catch up | about 15 s (re-index) | 4.0 s |
+| Writes held up by each snapshot (every 10,000 entries) | 0.34-1.39 s | 0.12-0.16 s |
+| Slowest write at 16 writers | 3.25 s | 0.27-0.46 s |
+
+The image (172 MB) is sent with the snapshot (57 MB) to followers that are
+far behind; saving both takes 1.5-4.6 s on a writer thread, while writes go
+on. The first version serialized records and images on the applier,
+which made the pause longer (up to 1.4 s) before the copy was moved off it.
+
 ## Geo search (item 8)
 
 The 100k catalog with a `_geoloc` for every record, around 50 random

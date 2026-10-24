@@ -97,6 +97,14 @@
     2,000 seeds). Three processes with 100k records: leader killed with
     `kill -9` under load, writes back within 1.8 s, no acknowledged write
     lost; 453 writes/s from one writer, 7,573/s with 64.
+11c. ✅ Faster snapshot restores: each cluster snapshot has an image of
+    every index beside it (`snapshot.image`), loaded without re-indexing and
+    sent along to followers that are far behind; the records stay the
+    fallback when the image is missing, damaged or from another engine
+    version. A snapshot copies the state and serializes the copy on a
+    writer thread. 117k records: restart 13-17 s -> 0.6 s, a follower
+    31,000 entries behind caught up in 4 s, writes wait 150 ms per snapshot
+    instead of 0.4-1.4 s.
 
 ## Next
 
@@ -121,11 +129,10 @@
   primary's admin key (a dedicated replication key would be safer);
   replication traffic is plain HTTP unless the primary URL is https.
 - Cluster gaps: membership is fixed at startup (no adding or removing
-  nodes while running); a snapshot pauses applying on that node while the
-  state is exported (writes wait up to about 0.7 s at 117k records, every
-  10,000 entries); restoring a snapshot re-indexes every record (13-17 s
-  at 100k: add index images to cluster snapshots); snapshots are sent and
-  received whole in memory; searches read the local copy, so they can lag
+  nodes while running); a snapshot copies the whole state in memory (writes
+  wait about 150 ms at 117k records, every 10,000 entries, and memory
+  briefly doubles); snapshots are sent and received whole in memory, image
+  included (230 MB at 117k records); searches read the local copy, so they can lag
   the leader slightly (no linearizable reads); a write whose node loses
   the leader mid-way answers 503 although it may still be applied (writes
   are not retried automatically, as `clear` is not idempotent); nodes talk

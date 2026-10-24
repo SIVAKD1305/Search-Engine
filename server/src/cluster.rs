@@ -26,7 +26,7 @@
 use crate::ApiError;
 use crate::raft::{self, LogEntry, Message, NodeId, ProposeError, Raft, Role};
 use crate::raft_store::RaftStore;
-use crate::state::{AppState, Command};
+use crate::state::{AppState, Command, StateView};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
@@ -36,9 +36,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// How long a write waits to be agreed on before giving up, by default.
@@ -143,8 +143,9 @@ pub struct Cluster {
     status: Mutex<Status>,
     applied: watch::Sender<u64>,
     waiters: Mutex<HashMap<u64, Waiter>>,
-    /// Held while the snapshot file is replaced, by the applier (its own
-    /// snapshots) and the Raft loop (the leader's).
+    /// Held while the snapshot files are replaced or read together, by the
+    /// writer (this node's snapshots), the Raft loop (the leader's) and
+    /// snapshot sending.
     snapshot_file: Mutex<()>,
     client: reqwest::Client,
 }
@@ -160,9 +161,8 @@ impl Cluster {
         let loaded = RaftStore::open(&config.dir)?;
         let mut snapshot = (0, 0);
         if let Some(header) = loaded.snapshot {
-            let (_, bytes) = RaftStore::read_snapshot(&loaded.store.snapshot_path())?;
-            state.import_state(&bytes).map_err(|e| io::Error::other(e.to_string()))?;
             snapshot = (header.last_index, header.last_term);
+            load_snapshot(&state, &loaded.store.snapshot_path(), header.last_index, true)?;
         }
         let ids: Vec<NodeId> = config.members.iter().map(|m| m.id.clone()).collect();
         if !ids.contains(&config.id) {
@@ -198,10 +198,15 @@ impl Cluster {
             tokio::spawn(send_to_peer(cluster.clone(), member.clone(), rx));
         }
         let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
         let snapshot_path = loaded.store.snapshot_path();
         {
-            let (cluster, state) = (cluster.clone(), state.clone());
-            std::thread::spawn(move || apply_loop(cluster, state, apply_rx, snapshot.0, snapshot_path));
+            let (cluster, state, path) = (cluster.clone(), state.clone(), snapshot_path.clone());
+            std::thread::spawn(move || apply_loop(cluster, state, apply_rx, write_tx, snapshot.0, path));
+        }
+        {
+            let cluster = cluster.clone();
+            std::thread::spawn(move || write_loop(cluster, write_rx, snapshot_path));
         }
         tokio::spawn(raft_loop(cluster.clone(), raft, loaded.store, events_rx, apply_tx, peers));
         state.cluster.set(cluster.clone()).map_err(|_| io::Error::other("cluster already started"))?;
@@ -331,6 +336,7 @@ async fn raft_loop(
             }
             Event::Snapshot { from, term, last_index, last_term, path } => {
                 if let Some(old) = incoming.replace(path) {
+                    let _ = std::fs::remove_file(RaftStore::image_of(&old));
                     let _ = std::fs::remove_file(old);
                 }
                 raft.step(&from, Message::InstallSnapshot { term, last_index, last_term });
@@ -372,6 +378,14 @@ async fn raft_loop(
                 let path = incoming.take().expect("a restore follows a received snapshot");
                 let _file = cluster.snapshot_file.lock().unwrap();
                 std::fs::rename(&path, store.snapshot_path())?;
+                // The leader's image, if it sent one; an older own image
+                // would not match anyway.
+                let (image, own_image) = (RaftStore::image_of(&path), RaftStore::image_of(&store.snapshot_path()));
+                if image.exists() {
+                    std::fs::rename(&image, &own_image)?;
+                } else {
+                    let _ = std::fs::remove_file(&own_image);
+                }
             }
             if let Some(hard) = &ready.hard_state {
                 store.save_hard_state(hard)?;
@@ -420,11 +434,59 @@ async fn raft_loop(
     }
 }
 
-/// Applies committed entries in order, and snapshots now and then.
+/// Loads the snapshot at `path` (ending at entry `expected`) into `state`:
+/// from its image when there is a matching one, which needs no
+/// re-indexing; otherwise from the snapshot itself. With `make_image`, a
+/// missing or unusable image is written afresh, so the next start is fast.
+fn load_snapshot(state: &AppState, path: &Path, expected: u64, make_image: bool) -> io::Result<()> {
+    let started = Instant::now();
+    let image = RaftStore::image_of(path);
+    let from_image = match RaftStore::read_snapshot(&image) {
+        Ok((header, bytes)) if header.last_index == expected => match state.import_images(&bytes) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("cluster: {e}; loading the snapshot instead");
+                false
+            }
+        },
+        Ok(_) => false,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            eprintln!("cluster: {e}; loading the snapshot instead");
+            false
+        }
+    };
+    if !from_image {
+        let (header, bytes) = RaftStore::read_snapshot(path)?;
+        assert_eq!(header.last_index, expected, "the snapshot file is the one expected");
+        state.import_state(&bytes).map_err(|e| io::Error::other(e.to_string()))?;
+        if make_image {
+            RaftStore::write_snapshot(&image, header.last_index, header.last_term, &state.export_images())?;
+        }
+    }
+    let how = if from_image { "image" } else { "records" };
+    println!("cluster: loaded the snapshot up to entry {expected} from its {how} in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+    Ok(())
+}
+
+/// A snapshot for the writer to serialize and save: a copy of the state
+/// as of an entry; `with_records` false saves only an image (to replace a
+/// missing one for the snapshot in place).
+struct SnapshotJob {
+    last_index: u64,
+    last_term: u64,
+    view: StateView,
+    with_records: bool,
+}
+
+/// Applies committed entries in order, and snapshots now and then: it
+/// only copies the state, and the writer thread serializes and saves the
+/// copy, so applying pauses as briefly as possible.
 fn apply_loop(
     cluster: Arc<Cluster>,
     state: Arc<AppState>,
     entries: std::sync::mpsc::Receiver<Apply>,
+    writer: std::sync::mpsc::Sender<SnapshotJob>,
     mut applied: u64,
     snapshot_path: PathBuf,
 ) {
@@ -432,23 +494,19 @@ fn apply_loop(
     let mut applied_term = 0;
     for work in entries {
         match work {
-            Apply::Restore(expected) => match RaftStore::read_snapshot(&snapshot_path) {
-                Ok((header, bytes)) => {
-                    assert_eq!(header.last_index, expected, "the snapshot file is the one received");
-                    if let Err(e) = state.import_state(&bytes) {
-                        eprintln!("cluster: cannot load the leader's snapshot: {e}; stopping");
-                        std::process::exit(1);
-                    }
-                    applied = header.last_index;
-                    applied_term = header.last_term;
-                    last_snapshot = applied;
-                    println!("cluster: loaded a snapshot up to entry {applied}");
-                }
-                Err(e) => {
-                    eprintln!("cluster: cannot read the received snapshot: {e}; stopping");
+            Apply::Restore(expected) => {
+                if let Err(e) = load_snapshot(&state, &snapshot_path, expected, false) {
+                    eprintln!("cluster: cannot load the leader's snapshot: {e}; stopping");
                     std::process::exit(1);
                 }
-            },
+                applied = expected;
+                applied_term = RaftStore::read_snapshot_term(&snapshot_path).unwrap_or(0);
+                last_snapshot = applied;
+                if !RaftStore::image_of(&snapshot_path).exists() {
+                    let job = SnapshotJob { last_index: applied, last_term: applied_term, view: state.view(), with_records: false };
+                    let _ = writer.send(job);
+                }
+            }
             Apply::Entries(list) => {
                 for entry in list {
                     if entry.index <= applied {
@@ -472,21 +530,74 @@ fn apply_loop(
         }
         cluster.applied.send_replace(applied);
         if applied >= last_snapshot + cluster.config.snapshot_every {
-            let bytes = state.export_state();
+            let started = Instant::now();
+            let job = SnapshotJob { last_index: applied, last_term: applied_term, view: state.view(), with_records: true };
+            println!(
+                "cluster: state copied for the snapshot of entry {applied} in {:.0} ms (writes waited meanwhile)",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            last_snapshot = applied;
+            let _ = writer.send(job);
+        }
+    }
+}
+
+/// Saves snapshots (and their images), then lets the Raft loop drop the
+/// log entries they hold.
+fn write_loop(cluster: Arc<Cluster>, jobs: std::sync::mpsc::Receiver<SnapshotJob>, snapshot_path: PathBuf) {
+    let image_path = RaftStore::image_of(&snapshot_path);
+    for job in jobs {
+        let started = Instant::now();
+        let (index, term) = (job.last_index, job.last_term);
+        // Serialized and written under temporary names first: only the
+        // renames below hold the lock the Raft loop also takes.
+        let prepared = (|| -> io::Result<(Option<PathBuf>, PathBuf)> {
+            let records = match job.with_records {
+                true => Some(RaftStore::prepare_snapshot(&snapshot_path, index, term, &job.view.records())?),
+                false => None,
+            };
+            let image = RaftStore::prepare_snapshot(&image_path, index, term, &job.view.images())?;
+            Ok((records, image))
+        })();
+        drop(job.view);
+        let (records, image) = match prepared {
+            Ok(files) => files,
+            Err(e) => {
+                eprintln!("cluster: snapshot failed: {e}");
+                continue;
+            }
+        };
+        let installed = (|| -> io::Result<bool> {
             let _file = cluster.snapshot_file.lock().unwrap();
             // A newer snapshot from the leader may be in place, waiting to
             // be loaded: never replace it with an older one.
-            let current = RaftStore::snapshot_index(&snapshot_path).unwrap_or(None).unwrap_or(0);
-            if current >= applied {
-                continue;
+            let current = RaftStore::snapshot_index(&snapshot_path)?.unwrap_or(0);
+            let wanted = match &records {
+                Some(_) => current < index,
+                // Only an image: for the snapshot in place.
+                None => current == index,
+            };
+            if !wanted {
+                return Ok(false);
             }
-            match RaftStore::write_snapshot(&snapshot_path, applied, applied_term, &bytes) {
-                Ok(_) => {
-                    last_snapshot = applied;
-                    let _ = cluster.events.send(Event::Snapshotted(applied));
+            if let Some(records) = &records {
+                RaftStore::install(records, &snapshot_path)?;
+            }
+            RaftStore::install(&image, &image_path)?;
+            Ok(true)
+        })();
+        for leftover in records.iter().chain([&image]) {
+            let _ = std::fs::remove_file(leftover);
+        }
+        match installed {
+            Ok(true) => {
+                println!("cluster: snapshot of entry {index} saved in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+                if records.is_some() {
+                    let _ = cluster.events.send(Event::Snapshotted(index));
                 }
-                Err(e) => eprintln!("cluster: snapshot failed: {e}"),
             }
+            Ok(false) => {}
+            Err(e) => eprintln!("cluster: snapshot failed: {e}"),
         }
     }
 }
@@ -515,22 +626,40 @@ async fn send_to_peer(cluster: Arc<Cluster>, peer: Member, mut queue: mpsc::Unbo
     }
 }
 
-/// Sends this node's current snapshot to a follower that is too far behind.
+/// Sends this node's current snapshot to a follower that is too far behind,
+/// with its image when it has one for the same entry: the snapshot's bytes,
+/// then the image's (`snapshotLength` says where they split).
 async fn send_snapshot(cluster: Arc<Cluster>, peer: NodeId, term: u64, path: PathBuf) {
     let result: Result<(), String> = async {
         let url = cluster.url_of(&peer).ok_or("unknown peer")?.to_owned();
-        let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
-        // The file may be newer than the message that asked for it: send
-        // what it holds.
-        let (header, _) = RaftStore::parse_snapshot(&bytes)?;
-        let query =
-            format!("from={}&term={term}&lastIndex={}&lastTerm={}", cluster.config.id, header.last_index, header.last_term);
+        let files = {
+            let cluster = cluster.clone();
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>), String> {
+                // Read together, so the image matches the snapshot.
+                let _file = cluster.snapshot_file.lock().unwrap();
+                let snapshot = std::fs::read(&path).map_err(|e| e.to_string())?;
+                let image = std::fs::read(RaftStore::image_of(&path)).unwrap_or_default();
+                Ok((snapshot, image))
+            })
+        };
+        let (mut body, image) = files.await.map_err(|e| e.to_string())??;
+        // The files may be newer than the message that asked for them: send
+        // what they hold.
+        let (header, _) = RaftStore::parse_snapshot(&body)?;
+        let snapshot_length = body.len();
+        if RaftStore::parse_snapshot(&image).is_ok_and(|(h, _)| h.last_index == header.last_index) {
+            body.extend_from_slice(&image);
+        }
+        let query = format!(
+            "from={}&term={term}&lastIndex={}&lastTerm={}&snapshotLength={snapshot_length}",
+            cluster.config.id, header.last_index, header.last_term
+        );
         let response = cluster
             .client
             .post(format!("{url}/1/cluster/snapshot?{query}"))
             .header("X-Algolia-API-Key", &cluster.config.admin_key)
             .timeout(Duration::from_secs(600))
-            .body(bytes)
+            .body(body)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -580,6 +709,8 @@ struct SnapshotQuery {
     term: u64,
     last_index: u64,
     last_term: u64,
+    /// Bytes of the snapshot; an image may follow (absent: the whole body).
+    snapshot_length: Option<usize>,
 }
 
 async fn receive_snapshot(
@@ -588,18 +719,28 @@ async fn receive_snapshot(
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let cluster = cluster_of(&state)?;
-    let (header, _) = RaftStore::parse_snapshot(&body).map_err(ApiError::bad_request)?;
+    let split = q.snapshot_length.unwrap_or(body.len()).min(body.len());
+    let (snapshot, image) = (body.slice(..split), body.slice(split..));
+    let (header, _) = RaftStore::parse_snapshot(&snapshot).map_err(ApiError::bad_request)?;
     if (header.last_index, header.last_term) != (q.last_index, q.last_term) {
         return Err(ApiError::bad_request("snapshot header does not match the request"));
     }
+    // A damaged or mismatched image is dropped: the snapshot alone will do.
+    let image_ok = RaftStore::parse_snapshot(&image).is_ok_and(|(h, _)| h.last_index == header.last_index);
     let path = cluster.config.dir.join(format!("snapshot.incoming-{:016x}", rand::random::<u64>()));
     let written = tokio::task::spawn_blocking({
         let path = path.clone();
         move || -> io::Result<()> {
             use std::io::Write;
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(&body)?;
-            file.sync_all()
+            let save = |to: &Path, bytes: &[u8]| -> io::Result<()> {
+                let mut file = std::fs::File::create(to)?;
+                file.write_all(bytes)?;
+                file.sync_all()
+            };
+            if image_ok {
+                save(&RaftStore::image_of(&path), &image)?;
+            }
+            save(&path, &snapshot)
         }
     })
     .await

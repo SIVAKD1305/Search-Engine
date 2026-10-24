@@ -7,6 +7,9 @@
 //! - `snapshot`: the applied state up to some entry: a header line
 //!   `{"lastIndex":I,"lastTerm":T,"crc":C,"length":L}` and `L` bytes of state
 //!   (see `cluster`). Written to a temporary file and renamed into place.
+//! - `snapshot.image`: the same state with every index already built, in the
+//!   same container, so a restart loads it without re-indexing. Only a
+//!   cache: used when it is intact and ends at the snapshot's entry.
 //!
 //! Every change is fsynced before Raft's messages go out, as Raft requires.
 
@@ -75,6 +78,14 @@ fn encode(entry: &LogEntry) -> Vec<u8> {
 impl RaftStore {
     pub fn open(dir: &Path) -> io::Result<Loaded> {
         fs::create_dir_all(dir)?;
+        // Leftovers of a crash: unfinished snapshot files, and snapshots
+        // received but never installed.
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.contains(".tmp-") || name.starts_with("snapshot.incoming") {
+                fs::remove_file(dir.join(&name))?;
+            }
+        }
         let hard_path = dir.join("hard.json");
         let hard = match fs::read(&hard_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| invalid(&hard_path, e))?,
@@ -201,6 +212,13 @@ impl RaftStore {
         self.dir.join("snapshot")
     }
 
+    /// The image file that goes with the snapshot file at `path`.
+    pub fn image_of(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".image");
+        PathBuf::from(name)
+    }
+
     /// Where a snapshot received from the leader is written first.
     pub fn incoming_path(&self) -> PathBuf {
         self.dir.join("snapshot.incoming")
@@ -208,6 +226,11 @@ impl RaftStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The last term of the snapshot at `path`.
+    pub fn read_snapshot_term(path: &Path) -> io::Result<u64> {
+        Self::read_snapshot_header(path)?.map(|h| h.last_term).ok_or_else(|| invalid(path, "no snapshot"))
     }
 
     /// The last index of the snapshot at `path`, if there is one.
@@ -242,6 +265,28 @@ impl RaftStore {
         bytes.extend_from_slice(state);
         replace_file(path, &bytes)?;
         Ok(header)
+    }
+
+    /// Writes a snapshot file next to `path` under a temporary name, synced,
+    /// for `install` to rename into place.
+    pub fn prepare_snapshot(path: &Path, last_index: u64, last_term: u64, state: &[u8]) -> io::Result<PathBuf> {
+        let header =
+            SnapshotHeader { last_index, last_term, crc: crc32fast::hash(state), length: state.len() as u64 };
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".tmp-{:016x}", rand::random::<u64>()));
+        let tmp = PathBuf::from(name);
+        let mut file = File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec(&header)?)?;
+        file.write_all(b"\n")?;
+        file.write_all(state)?;
+        file.sync_all()?;
+        Ok(tmp)
+    }
+
+    /// Renames a prepared snapshot file into place.
+    pub fn install(prepared: &Path, path: &Path) -> io::Result<()> {
+        fs::rename(prepared, path)?;
+        sync_dir(path.parent().expect("files live in a directory"))
     }
 
     /// Reads and checks a snapshot file: its header and state bytes.
@@ -336,6 +381,21 @@ mod tests {
         drop(loaded);
         let loaded = RaftStore::open(dir.path()).unwrap();
         assert_eq!(loaded.entries, [entry(3, 1)]);
+    }
+
+    #[test]
+    fn leftovers_of_a_crash_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot");
+        let prepared = RaftStore::prepare_snapshot(&path, 3, 1, b"s").unwrap();
+        fs::write(dir.path().join("snapshot.incoming-12"), b"x").unwrap();
+        fs::write(dir.path().join("snapshot.incoming-12.image"), b"x").unwrap();
+        RaftStore::open(dir.path()).unwrap();
+        let mut names: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["log"]);
+        assert!(!prepared.exists());
     }
 
     #[test]

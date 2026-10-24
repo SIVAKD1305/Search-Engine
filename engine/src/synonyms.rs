@@ -74,7 +74,7 @@ impl TryFrom<RawSynonym> for Synonym {
 }
 
 /// Normalized phrase (its words) -> the phrases it can stand for.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SynonymMap {
     map: HashMap<Vec<String>, Vec<Vec<String>>>,
     /// Longest phrase with alternatives, in words.

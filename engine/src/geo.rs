@@ -154,7 +154,7 @@ fn bounds_of(area: &[f64]) -> Bounds {
     )
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct GeoIndex {
     /// Indexed by DocId.
     points: Vec<Vec<GeoPoint>>,

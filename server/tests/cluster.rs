@@ -171,6 +171,13 @@ async fn leader_other_than(nodes: &[&Node], dead: &str) -> String {
     }
 }
 
+/// The JSON header line of a snapshot or image file.
+fn header(path: &Path) -> Value {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let end = bytes.iter().position(|&b| b == b'\n').unwrap();
+    serde_json::from_slice(&bytes[..end]).unwrap()
+}
+
 fn expected(n: usize) -> Vec<String> {
     let mut ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
     ids.sort();
@@ -271,6 +278,9 @@ async fn a_far_behind_node_catches_up_from_a_snapshot() {
     eventually("the node is restored from a snapshot", || async { ids(back, "kettle").await == Some(expected(60)) }).await;
     let st = status(back).await;
     assert!(st["snapshotIndex"].as_u64().unwrap() >= 15, "{st}");
+    // The leader's image came with its snapshot.
+    let dir = &c.dirs[away];
+    assert_eq!(header(&dir.join("snapshot.image"))["lastIndex"], header(&dir.join("snapshot"))["lastIndex"]);
     // And keeps following.
     assert_eq!(put(back, "late", "kettle").await.0, 200);
     for node in nodes.iter().flatten() {
@@ -296,10 +306,23 @@ async fn the_whole_cluster_restarts_with_its_data() {
     for node in nodes {
         node.kill();
     }
+    // Every node has an image of its snapshot, for the same entry.
+    for dir in &c.dirs {
+        let snapshot = header(&dir.join("snapshot"));
+        assert_eq!(header(&dir.join("snapshot.image"))["lastIndex"], snapshot["lastIndex"], "{dir:?}");
+    }
+    // One node's image is damaged: it loads from the records instead, and
+    // writes a good image again.
+    let image = c.dirs[0].join("snapshot.image");
+    let mut bytes = std::fs::read(&image).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&image, &bytes).unwrap();
     let nodes: Vec<Node> = (0..3).map(|i| c.start(i)).collect();
     for node in &nodes {
         eventually("data back after a full restart", || async { ids(node, "kettle").await == Some(expected(40)) }).await;
     }
+    assert_ne!(std::fs::read(&image).unwrap(), bytes, "the damaged image was replaced");
     assert_eq!(put(&nodes[0], "p40", "kettle").await.0, 200);
     for node in nodes {
         node.kill();

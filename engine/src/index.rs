@@ -47,7 +47,7 @@ pub const MAX_STORED_PREFIX: usize = 4;
 /// A dictionary word's permanent number; ids of removed words are not reused.
 pub type WordId = u32;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Postings {
     pub id: WordId,
     pub word: String,
@@ -71,7 +71,7 @@ impl Occurrence {
 }
 
 /// Records containing a word that starts with a given prefix.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PrefixDocs {
     pub docs: RoaringBitmap,
     /// The same, per attribute (indexed by AttributeId).
@@ -149,7 +149,7 @@ pub struct IndexStats {
 
 /// `Serialize` writes an index image (see `write_image`); the skipped
 /// fields are rebuilt when it is read.
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Index {
     store: DocumentStore,
     #[serde(skip)]

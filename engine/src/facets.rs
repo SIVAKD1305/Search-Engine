@@ -56,7 +56,7 @@ pub struct FacetCount {
     pub count: u64,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct FacetValue {
     display: String,
     /// The value as a number, when records give it as a JSON number.
@@ -77,7 +77,7 @@ pub struct FacetStats {
 /// One facet attribute. Values get permanent ids; each record keeps the ids
 /// of its values, so counts can be taken record by record when that is
 /// cheaper than one intersection per value.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct FacetValues {
     ids: HashMap<String, u32>,
     values: Vec<FacetValue>,
@@ -89,7 +89,7 @@ struct FacetValues {
 /// matching records per distinct value.
 const RECORDS_PER_VALUE_FOR_RECORD_COUNTING: u64 = 32;
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FacetIndex {
     attributes: HashMap<String, FacetValues>,
 }
@@ -243,7 +243,7 @@ impl Ord for Number {
 /// a u64 in the same order (`ordered`).
 const LEVEL_SHIFTS: [u32; 3] = [56, 48, 40];
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct NumericValues {
     /// Every (value, record) pair, for exact edges and removals.
     values: BTreeSet<(Number, DocId)>,
@@ -322,7 +322,7 @@ fn unordered(key: u64) -> f64 {
     f64::from_bits(bits)
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NumericIndex {
     attributes: HashMap<String, NumericValues>,
 }

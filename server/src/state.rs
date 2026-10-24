@@ -125,6 +125,59 @@ fn cluster_epoch(log_index: u64) -> u64 {
     (z ^ (z >> 31)) | 1
 }
 
+/// Every index and key at one moment (`AppState::view`).
+pub struct StateView {
+    keys: Vec<ApiKey>,
+    /// Name, sequence number, epoch and the index.
+    indexes: Vec<(String, u64, u64, Index)>,
+}
+
+impl StateView {
+    /// The state in `AppState::export_state`'s format.
+    pub fn records(&self) -> Vec<u8> {
+        let mut parts = Vec::new();
+        let mut indexes = Vec::new();
+        for (name, seq, epoch, index) in &self.indexes {
+            let mut bytes = Vec::new();
+            storage::write_snapshot_to(&mut bytes, index, *seq, *epoch).expect("writing to memory");
+            indexes.push((name.clone(), bytes.len()));
+            parts.push(bytes);
+        }
+        join(&ExportHeader { keys: self.keys.clone(), indexes }, parts)
+    }
+
+    /// The state in `AppState::export_images`'s format.
+    pub fn images(&self) -> Vec<u8> {
+        let mut parts = Vec::new();
+        let mut indexes = Vec::new();
+        for (name, seq, epoch, index) in &self.indexes {
+            let mut bytes = Vec::new();
+            index.write_image(&mut bytes).expect("writing to memory");
+            indexes.push((name.clone(), *seq, *epoch, bytes.len()));
+            parts.push(bytes);
+        }
+        join(&ImagesHeader { keys: self.keys.clone(), indexes }, parts)
+    }
+}
+
+/// A JSON header line followed by the parts.
+fn join(header: &impl Serialize, parts: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut out = serde_json::to_vec(header).expect("serializable");
+    out.push(b'\n');
+    for part in parts {
+        out.extend_from_slice(&part);
+    }
+    out
+}
+
+/// The header of exported index images (`AppState::export_images`).
+#[derive(Serialize, Deserialize)]
+struct ImagesHeader {
+    keys: Vec<ApiKey>,
+    /// Name, sequence number, epoch and image length of each index.
+    indexes: Vec<(String, u64, u64, usize)>,
+}
+
 /// The header of an exported state (`AppState::export_state`).
 #[derive(Serialize, Deserialize)]
 struct ExportHeader {
@@ -514,23 +567,58 @@ impl AppState {
     /// Every index (with its position) and every key, for a cluster
     /// snapshot: a JSON header line, then each index's snapshot.
     pub fn export_state(&self) -> Vec<u8> {
-        let mut parts = Vec::new();
-        let mut indexes = Vec::new();
-        for (name, entry) in self.indexes() {
-            let log = entry.log.lock().unwrap();
-            let index = entry.index.read().unwrap();
-            let mut bytes = Vec::new();
-            storage::write_snapshot_to(&mut bytes, &index, log.seq, log.epoch).expect("writing to memory");
-            indexes.push((name, bytes.len()));
-            parts.push(bytes);
+        self.view().records()
+    }
+
+    /// The same as `export_state`, with each index as an image (see
+    /// `Index::write_image`): loads without re-indexing, but only into the
+    /// same engine version.
+    pub fn export_images(&self) -> Vec<u8> {
+        self.view().images()
+    }
+
+    /// A copy of every index and key as they are now. Copying is much
+    /// faster than serializing, so writes wait only for the copy.
+    pub fn view(&self) -> StateView {
+        let indexes = self
+            .indexes()
+            .into_iter()
+            .map(|(name, entry)| {
+                let log = entry.log.lock().unwrap();
+                let index = entry.index.read().unwrap().clone();
+                (name, log.seq, log.epoch, index)
+            })
+            .collect();
+        StateView { keys: self.keys.list(), indexes }
+    }
+
+    /// Replaces every index and key with exported images. Fails, changing
+    /// nothing, if any image cannot be read (another engine version).
+    pub fn import_images(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        let corrupt = |m: String| StorageError::Corrupt(format!("cluster images: {m}"));
+        let newline = bytes.iter().position(|&b| b == b'\n').ok_or_else(|| corrupt("no header".into()))?;
+        let header: ImagesHeader = serde_json::from_slice(&bytes[..newline]).map_err(|e| corrupt(e.to_string()))?;
+        let mut offset = newline + 1;
+        // Read every image before installing any.
+        let mut loaded = Vec::new();
+        for (name, seq, epoch, len) in header.indexes {
+            let part = bytes.get(offset..offset + len).ok_or_else(|| corrupt(format!("{name} is cut short")))?;
+            offset += len;
+            let index = Index::read_image(part).map_err(|e| corrupt(format!("{name}: {e}")))?;
+            loaded.push((name, SnapshotData { index, seq, epoch: Some(epoch) }));
         }
-        let header = ExportHeader { keys: self.keys.list(), indexes };
-        let mut out = serde_json::to_vec(&header).expect("serializable");
-        out.push(b'\n');
-        for part in parts {
-            out.extend_from_slice(&part);
+        let names: Vec<String> = loaded.iter().map(|(n, _)| n.clone()).collect();
+        for (name, data) in loaded {
+            self.install_index(&name, data)?;
         }
-        out
+        for name in self.index_names() {
+            if !names.contains(&name) {
+                self.remove_index(&name)?;
+            }
+        }
+        self.keys.replace_all(header.keys)?;
+        self.changed();
+        Ok(())
     }
 
     /// Replaces every index and key with an exported state.
@@ -739,5 +827,33 @@ mod tests {
             }
         }
     }
-}
 
+    #[test]
+    fn exported_images_load_the_same_state_or_nothing() {
+        let state = AppState::new("a".into(), "s".into());
+        let write = |index: &str, ops: Vec<Op>, at: u64| {
+            state.apply_command(Command::Write { index: index.into(), create: true, ops }, at).unwrap();
+        };
+        let record = |id: &str, name: &str| Op::Put(id.into(), serde_json::json!({"name": name}).as_object().unwrap().clone());
+        write("products", vec![record("1", "Kettle"), record("2", "Lamp")], 1);
+        write("movies", vec![record("m", "Alien")], 2);
+        write("products", vec![Op::Delete("1".into())], 3);
+        let images = state.export_images();
+
+        let copy = AppState::new("a".into(), "s".into());
+        copy.apply_command(Command::Write { index: "stale".into(), create: true, ops: vec![] }, 1).unwrap();
+        copy.import_images(&images).unwrap();
+        assert_eq!(copy.index_names(), ["movies", "products"]);
+        assert_eq!(copy.export_state(), state.export_state());
+        assert_eq!(copy.index("products").unwrap().position(), state.index("products").unwrap().position());
+
+        // A damaged image is refused before anything changes.
+        let other = AppState::new("a".into(), "s".into());
+        other.apply_command(Command::Write { index: "kept".into(), create: true, ops: vec![] }, 1).unwrap();
+        let mut damaged = images.clone();
+        let last = damaged.len() - 10;
+        damaged.truncate(last);
+        assert!(other.import_images(&damaged).is_err());
+        assert_eq!(other.index_names(), ["kept"]);
+    }
+}
