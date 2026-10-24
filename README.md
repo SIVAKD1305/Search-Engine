@@ -1,4 +1,6 @@
-# search-engine
+# Search-Engine
+
+AI Search-Engine.
 
 An Algolia-style search engine written from scratch in Rust.
 
