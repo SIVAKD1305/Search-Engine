@@ -12,9 +12,11 @@
 //! `taskID` is already `published`. With a data directory, each write is
 //! first made durable in the index's write-ahead log (see `storage`).
 
+pub mod cluster;
 pub mod keys;
 pub mod params;
 pub mod raft;
+pub mod raft_store;
 pub mod replication;
 pub mod state;
 pub mod storage;
@@ -28,12 +30,12 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use engine::index::{Index, Settings};
+use engine::index::Index;
 use engine::search::{SearchParams, search};
 use keys::{ApiKey, Caller, Grant, KeyRequest};
 use params::ResponseOptions;
 use serde_json::{Map, Value, json};
-use state::Op;
+use state::{Command, Op};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -193,6 +195,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/1/keys", get(list_keys).post(create_key))
         .route("/1/keys/{key}", get(get_key).put(update_key).delete(delete_key))
         .merge(replication::routes().without_v07_checks().route_layer(middleware::from_fn(admin_only)))
+        .merge(cluster::routes().without_v07_checks().route_layer(middleware::from_fn(admin_only)))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
 
     Router::new()
@@ -351,6 +354,43 @@ async fn commit(state: &Arc<AppState>, entry: state::SharedIndex, ops: Vec<Op>) 
     tokio::task::spawn_blocking(move || state.commit(&entry, ops)).await.expect("commit task")
 }
 
+/// Writes `ops` to the index `name` (creating it if `create`): directly, or
+/// through the cluster's agreement when this server is a cluster node.
+async fn write(state: &Arc<AppState>, name: &str, create: bool, ops: Vec<Op>) -> Result<(), ApiError> {
+    let Some(cluster) = state.cluster.get() else {
+        let entry = if create { state.index_or_create(name)? } else { state.index(name)? };
+        return commit(state, entry, ops).await;
+    };
+    validate_index_name(name)?;
+    if !create {
+        state.index(name)?;
+    }
+    cluster.submit(&Command::Write { index: name.to_owned(), create, ops }).await
+}
+
+/// A change that is not an index write: applied here, or agreed on by the
+/// cluster.
+async fn change(state: &Arc<AppState>, command: Command) -> Result<(), ApiError> {
+    state.ensure_writable()?;
+    if let Some(cluster) = state.cluster.get() {
+        return cluster.submit(&command).await;
+    }
+    match command {
+        Command::DeleteIndex { index } => state.delete_index(&index),
+        Command::PutKey { key } => {
+            state.keys.put(key).map_err(key_storage_error)?;
+            state.changed();
+            Ok(())
+        }
+        Command::DeleteKey { value } => {
+            state.keys.remove(&value).map_err(key_storage_error)?;
+            state.changed();
+            Ok(())
+        }
+        Command::Write { .. } => unreachable!("index writes go through write()"),
+    }
+}
+
 fn object_id_of(record: &Map<String, Value>) -> Option<String> {
     match record.get("objectID") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -374,13 +414,14 @@ async fn list_indexes(State(state): State<Arc<AppState>>, Extension(grant): Key)
 
 async fn delete_index(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>) -> ApiResult {
     grant.require("deleteIndex", Some(&name))?;
-    state.delete_index(&name)?;
+    state.index(&name)?;
+    change(&state, Command::DeleteIndex { index: name }).await?;
     Ok(Json(json!({ "taskID": state.task(), "deletedAt": now() })))
 }
 
 async fn clear_index(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(name): Path<String>) -> ApiResult {
     grant.require("deleteIndex", Some(&name))?;
-    commit(&state, state.index(&name)?, vec![Op::Clear]).await?;
+    write(&state, &name, false, vec![Op::Clear]).await?;
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
@@ -400,14 +441,11 @@ async fn set_settings(
 ) -> ApiResult {
     grant.require("editSettings", Some(&name))?;
     let changes = json_object(&body)?;
-    let entry = state.index_or_create(&name)?;
-    let mut merged = serde_json::to_value(entry.index.read().unwrap().settings()).expect("serializable");
-    for (k, v) in changes {
-        merged[k] = v;
-    }
-    let settings: Settings =
-        serde_json::from_value(merged).map_err(|e| ApiError::bad_request(format!("invalid settings: {e}")))?;
-    commit(&state, entry, vec![Op::Settings(settings)]).await?;
+    // Checked against the current settings; merged into the settings
+    // current when the change is applied.
+    let current = state.index(&name).map(|e| e.index.read().unwrap().settings().clone()).unwrap_or_default();
+    state::merge_settings(&current, &changes).map_err(ApiError::bad_request)?;
+    write(&state, &name, true, vec![Op::MergeSettings(changes)]).await?;
     Ok(Json(json!({ "taskID": state.task(), "updatedAt": now() })))
 }
 
@@ -429,7 +467,7 @@ async fn add_object(State(state): State<Arc<AppState>>, Extension(grant): Key, P
     grant.require("addObject", Some(&name))?;
     let record = json_object(&body)?;
     let object_id = object_id_of(&record).unwrap_or_else(|| state.new_object_id());
-    commit(&state, state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)]).await?;
+    write(&state, &name, true, vec![Op::Put(object_id.clone(), record)]).await?;
     Ok(Json(json!({ "createdAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -460,7 +498,7 @@ async fn put_object(
 ) -> ApiResult {
     grant.require("addObject", Some(&name))?;
     let record = json_object(&body)?;
-    commit(&state, state.index_or_create(&name)?, vec![Op::Put(object_id.clone(), record)]).await?;
+    write(&state, &name, true, vec![Op::Put(object_id.clone(), record)]).await?;
     Ok(Json(json!({ "updatedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -476,7 +514,7 @@ async fn partial_update(
     let query = params::from_query_string(q.as_deref().unwrap_or(""));
     let create = !query.get("createIfNotExists").is_some_and(|v| v == false);
     let op = Op::Partial { id: object_id.clone(), changes, create };
-    commit(&state, state.index_or_create(&name)?, vec![op]).await?;
+    write(&state, &name, true, vec![op]).await?;
     Ok(Json(json!({ "updatedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -486,7 +524,7 @@ async fn delete_object(
     Path((name, object_id)): Path<(String, String)>,
 ) -> ApiResult {
     grant.require("deleteObject", Some(&name))?;
-    commit(&state, state.index(&name)?, vec![Op::Delete(object_id.clone())]).await?;
+    write(&state, &name, false, vec![Op::Delete(object_id.clone())]).await?;
     Ok(Json(json!({ "deletedAt": now(), "taskID": state.task(), "objectID": object_id })))
 }
 
@@ -524,16 +562,16 @@ async fn batch(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(n
         let acl = match &op {
             Op::Put(..) | Op::Partial { .. } => "addObject",
             Op::Delete(_) => "deleteObject",
-            Op::Clear | Op::Settings(_) => "deleteIndex",
+            Op::Clear | Op::Settings(_) | Op::MergeSettings(_) => "deleteIndex",
         };
         grant.require(acl, Some(&name))?;
         match &op {
             Op::Put(id, _) | Op::Partial { id, .. } | Op::Delete(id) => object_ids.push(id.clone()),
-            Op::Clear | Op::Settings(_) => {}
+            Op::Clear | Op::Settings(_) | Op::MergeSettings(_) => {}
         }
         ops.push(op);
     }
-    commit(&state, state.index_or_create(&name)?, ops).await?;
+    write(&state, &name, true, ops).await?;
     Ok(Json(json!({ "taskID": state.task(), "objectIDs": object_ids })))
 }
 
@@ -567,8 +605,7 @@ async fn create_key(State(state): State<Arc<AppState>>, Extension(grant): Key, b
     };
     request.apply(&mut key)?;
     let value = key.value.clone();
-    state.keys.put(key).map_err(key_storage_error)?;
-    state.changed();
+    change(&state, Command::PutKey { key }).await?;
     Ok(Json(json!({ "key": value, "createdAt": now() })))
 }
 
@@ -594,18 +631,14 @@ async fn update_key(
         .map_err(|e| ApiError::bad_request(format!("invalid key: {e}")))?;
     let mut key = stored_key(&state, &value)?;
     request.apply(&mut key)?;
-    state.keys.put(key).map_err(key_storage_error)?;
-    state.changed();
+    change(&state, Command::PutKey { key }).await?;
     Ok(Json(json!({ "key": value, "updatedAt": now() })))
 }
 
 async fn delete_key(State(state): State<Arc<AppState>>, Extension(grant): Key, Path(value): Path<String>) -> ApiResult {
     grant.require_admin()?;
-    state.ensure_writable()?;
-    if !state.keys.remove(&value).map_err(key_storage_error)? {
-        return Err(ApiError::not_found("Key does not exist"));
-    }
-    state.changed();
+    stored_key(&state, &value)?;
+    change(&state, Command::DeleteKey { value }).await?;
     Ok(Json(json!({ "deletedAt": now() })))
 }
 

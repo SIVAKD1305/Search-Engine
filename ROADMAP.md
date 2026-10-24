@@ -85,10 +85,22 @@
      words, and query words forming an entry match its alternatives;
      Chinese/Japanese entries work however they are split.
 
+## Done after the ground work
+
+11b. ✅ Automatic failover with Raft (`server/src/raft.rs`, `cluster.rs`):
+    3 or 5 nodes agree on every write; a write is answered once a majority
+    has it on disk and the answering node has applied it; followers forward
+    writes to the leader; every node serves searches. Pre-Vote, leader
+    leases and check quorum keep a returning or cut-off node from disrupting
+    the cluster. The core is a pure state machine tested in a simulated
+    faulty network (crashes, partitions, loss, duplication, reordering;
+    2,000 seeds). Three processes with 100k records: leader killed with
+    `kill -9` under load, writes back within 1.8 s, no acknowledged write
+    lost; 453 writes/s from one writer, 7,573/s with 64.
+
 ## Next
 
-11b. Automatic failover: 3 nodes agree on every write (Raft) and elect a new
-    primary when one fails
+- Not decided yet.
 
 ## Remember for later
 
@@ -106,9 +118,19 @@
   still waits for its own fsync (about 0.7 ms here).
 - Replication gaps: a replica that was disconnected retries with backoff
   up to 10 s, so catch-up after an outage can take that long; replicas use the
-  primary's admin key (a dedicated replication key would be safer); the
-  primary is a single point of failure for writes until 11b; replication
-  traffic is plain HTTP unless the primary URL is https.
+  primary's admin key (a dedicated replication key would be safer);
+  replication traffic is plain HTTP unless the primary URL is https.
+- Cluster gaps: membership is fixed at startup (no adding or removing
+  nodes while running); a snapshot pauses applying on that node while the
+  state is exported (writes wait up to about 0.7 s at 117k records, every
+  10,000 entries); restoring a snapshot re-indexes every record (13-17 s
+  at 100k: add index images to cluster snapshots); snapshots are sent and
+  received whole in memory; searches read the local copy, so they can lag
+  the leader slightly (no linearizable reads); a write whose node loses
+  the leader mid-way answers 503 although it may still be applied (writes
+  are not retried automatically, as `clear` is not idempotent); nodes talk
+  plain HTTP authenticated with the shared admin key; rate limit counters
+  are per node; read replicas following a cluster node are untested.
 - Server gaps: applying a write holds the index's write lock, so a big batch
   pauses searches on that index while it is applied in memory (the fsync
   itself does not block searches; Algolia runs indexing in a separate

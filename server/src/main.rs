@@ -3,6 +3,7 @@
 //! Usage: server [--host 127.0.0.1] [--port 8080] [--data-dir DIR | --in-memory]
 //!               [--load NAME=records.jsonl[,settings.json]]...
 //!               [--replica-of PRIMARY_URL] [--trust-proxy]
+//!               [--cluster ID=URL,ID=URL,... --node-id ID]
 //!        server secured-key PARENT_KEY 'filters=...&validUntil=...'
 //!
 //! Data is kept in DIR (default `./search-data`) and reloaded at startup.
@@ -16,6 +17,14 @@
 //! primary's admin key from SEARCH_PRIMARY_ADMIN_KEY (default: its own
 //! admin key).
 //!
+//! With `--cluster`, the server is one node of a Raft cluster (see
+//! `server::cluster`): every node has every index and serves searches,
+//! writes are agreed on by a majority, and a new leader is elected when the
+//! leader fails. Each node is started with the same member list, its own
+//! `--node-id` and its own `--data-dir` (the Raft log and snapshots go in
+//! `DIR/raft`); all share SEARCH_ADMIN_KEY. `--load` submits the records
+//! through the cluster once it has a leader.
+//!
 //! `--trust-proxy` takes client addresses (for rate limits and
 //! `restrictSources`) from `X-Forwarded-For`; use it only behind a proxy
 //! that sets that header. `secured-key` prints a secured API key, as
@@ -23,10 +32,12 @@
 
 use engine::index::{Index, Settings};
 use rand::RngCore;
+use server::cluster::{Cluster, ClusterConfig};
 use server::replication::run_replica;
+use server::state::{Command, Op};
 use server::{AppState, app};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -69,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = Some(PathBuf::from("search-data"));
     let mut replica_of: Option<String> = None;
     let mut trust_proxy = false;
+    let mut cluster: Option<String> = None;
+    let mut node_id: Option<String> = None;
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("secured-key") {
         let (Some(parent), Some(params)) = (args.nth(1), args.next()) else {
@@ -86,6 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--in-memory" => data_dir = None,
             "--replica-of" => replica_of = Some(args.next().ok_or("--replica-of needs the primary's URL")?),
             "--trust-proxy" => trust_proxy = true,
+            "--cluster" => cluster = Some(args.next().ok_or("--cluster needs ID=URL,ID=URL,...")?),
+            "--node-id" => node_id = Some(args.next().ok_or("--node-id needs a value")?),
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -100,6 +115,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if search_generated {
         println!("search key: {search_key}  (set SEARCH_SEARCH_KEY to keep it)");
+    }
+
+    if let Some(spec) = &cluster {
+        let members = ClusterConfig::parse_members(spec)?;
+        let id = node_id.ok_or("--cluster needs --node-id")?;
+        let dir = data_dir.ok_or("a cluster node needs a --data-dir")?.join("raft");
+        if replica_of.is_some() {
+            return Err("--cluster and --replica-of cannot be combined".into());
+        }
+        let state = Arc::new(AppState::new(admin_key.clone(), search_key).trusting_proxy(trust_proxy));
+        let start = Instant::now();
+        let config = ClusterConfig::new(id.clone(), members, dir, admin_key);
+        let node = Cluster::start(state.clone(), config)?;
+        println!(
+            "cluster node {id}: {} index(es) loaded in {:.0} ms",
+            state.index_names().len(),
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+        println!("listening on http://{}", listener.local_addr()?);
+        if !loads.is_empty() {
+            tokio::spawn(load_into_cluster(node, loads));
+        }
+        let service = app(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
+        return Ok(());
     }
 
     let state = match &data_dir {
@@ -151,6 +192,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("checkpointed in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
     }
     Ok(())
+}
+
+/// Submits `--load` files through the cluster: the settings, then the
+/// records in batches of 1,000.
+async fn load_into_cluster(cluster: Arc<Cluster>, specs: Vec<String>) {
+    for spec in specs {
+        let result: Result<usize, Box<dyn std::error::Error>> = async {
+            let (name, files) = spec.split_once('=').ok_or("--load expects NAME=records.jsonl[,settings.json]")?;
+            let (records, settings) = match files.split_once(',') {
+                Some((r, s)) => (r, Some(s)),
+                None => (files, None),
+            };
+            let settings: Settings = match settings {
+                Some(path) => serde_json::from_reader(BufReader::new(File::open(path)?))?,
+                None => Settings::default(),
+            };
+            let write = |ops| Command::Write { index: name.to_owned(), create: true, ops };
+            cluster.submit(&write(vec![Op::Clear, Op::Settings(settings)])).await.map_err(|e| e.message)?;
+            let mut batch = Vec::new();
+            let mut count = 0;
+            for line in BufRead::lines(BufReader::new(File::open(records)?)) {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let serde_json::Value::Object(record) = serde_json::from_str(&line)? else {
+                    return Err("records must be JSON objects".into());
+                };
+                let id = match record.get("objectID") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Number(n)) => n.to_string(),
+                    _ => return Err("every record needs an objectID".into()),
+                };
+                batch.push(Op::Put(id, record));
+                count += 1;
+                if batch.len() == 1000 {
+                    cluster.submit(&write(std::mem::take(&mut batch))).await.map_err(|e| e.message)?;
+                }
+            }
+            if !batch.is_empty() {
+                cluster.submit(&write(batch)).await.map_err(|e| e.message)?;
+            }
+            Ok(count)
+        }
+        .await;
+        match result {
+            Ok(count) => println!("loaded {count} records through the cluster ({spec})"),
+            Err(e) => eprintln!("--load {spec}: {e}"),
+        }
+    }
 }
 
 /// Ctrl-C or SIGTERM.

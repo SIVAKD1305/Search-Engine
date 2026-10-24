@@ -261,24 +261,22 @@ impl NumericValues {
         }
     }
 
-    fn remove(&mut self, n: f64, id: DocId) {
-        if !self.values.remove(&(Number(n), id)) {
-            return;
-        }
-        let key = ordered(n);
-        // The record may have another value in the same bucket (arrays).
-        for (level, shift) in self.levels.iter_mut().zip(LEVEL_SHIFTS) {
-            let bucket = key >> shift;
-            let start = unordered(bucket << shift);
-            let end = unordered((bucket << shift) | ((1u64 << shift) - 1));
-            let still_there = self
-                .values
-                .range((Number(start), DocId::MIN)..=(Number(end), DocId::MAX))
-                .any(|&(_, d)| d == id);
-            if !still_there && let Some(docs) = level.get_mut(&bucket) {
-                docs.remove(id);
-                if docs.is_empty() {
-                    level.remove(&bucket);
+    /// Removes all of a record's values (the record is being deleted or
+    /// replaced). With every value gone, the record leaves each of their
+    /// buckets: no need to look for other values in the same bucket.
+    fn remove_all(&mut self, values: &[f64], id: DocId) {
+        for &n in values {
+            if !self.values.remove(&(Number(n), id)) {
+                continue;
+            }
+            let key = ordered(n);
+            for (level, shift) in self.levels.iter_mut().zip(LEVEL_SHIFTS) {
+                let bucket = key >> shift;
+                if let Some(docs) = level.get_mut(&bucket) {
+                    docs.remove(id);
+                    if docs.is_empty() {
+                        level.remove(&bucket);
+                    }
                 }
             }
         }
@@ -353,9 +351,7 @@ impl NumericIndex {
     pub fn remove(&mut self, id: DocId, doc: &Map<String, Value>) {
         for (attribute, value) in doc {
             let Some(values) = self.attributes.get_mut(attribute) else { continue };
-            for n in numbers(value) {
-                values.remove(n, id);
-            }
+            values.remove_all(&numbers(value), id);
             if values.values.is_empty() {
                 self.attributes.remove(attribute);
             }
@@ -543,6 +539,12 @@ mod tests {
             let values: Vec<f64> = plain.iter().filter(|(_, d)| *d == id).map(|(v, _)| *v).collect();
             n.remove(id, &doc(json!({ "x": values })));
             plain.retain(|(_, d)| *d != id);
+        }
+        // Replace some of them with new values, as an update does.
+        for id in (0..2000u32).step_by(10) {
+            let values: Vec<f64> = (0..1 + next(2)).map(|_| value(next(4000))).collect();
+            n.add(id, &doc(json!({ "x": values })));
+            plain.extend(values.iter().map(|&v| (v, id)));
         }
         for _ in 0..300 {
             let (a, b) = (value(next(4000)), value(next(4000)));

@@ -78,6 +78,32 @@ The slowest queries at 1M are all facet counts over 150k-220k hits
 (`brand` and `category` together, 45-70 ms). Approximate counts on very
 large results, as Algolia does, are the next fix there.
 
+## Raft cluster (11b)
+
+Three server processes on one machine (4 cores shared with the load
+generator), the 100k catalog plus earlier test records (117k). Every write
+is answered after a majority fsynced it and the answering node applied it.
+
+| Writers | Through the leader | Through a follower |
+|---|---|---|
+| 1 | 453 writes/s (p50 1.8 ms) | 413 writes/s (p50 2.2 ms) |
+| 16 | 3,809 writes/s | 2,780 writes/s |
+| 64 | 7,573 writes/s | 4,613 writes/s |
+
+Loading the 100k catalog through the cluster takes 30 s (each node indexes
+every record). Failover: with one client writing through a follower, the
+leader was killed with `kill -9`; the longest gap between successful writes
+was 1.76 s, one write in flight answered 503 (it was applied after all),
+and all 1,778 acknowledged writes were on every node, including the old
+leader after it restarted.
+
+Two fixes came out of measuring this. Followers learned that an entry was
+committed only from the next heartbeat (100 ms per forwarded write); the
+leader now tells them as soon as it commits. And replacing a record that
+has numeric attributes scanned a whole bucket of the range-filter index
+(2.56 ms per update at 100k records); it now takes 0.18 ms, as adding one
+does, standalone too.
+
 ## Geo search (item 8)
 
 The 100k catalog with a `_geoloc` for every record, around 50 random

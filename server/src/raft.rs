@@ -95,13 +95,21 @@ pub struct Config {
     pub heartbeat_ticks: u32,
     /// Most entries in one `Append`.
     pub max_batch: usize,
+    /// Most command bytes in one `Append` (at least one entry is sent).
+    pub max_batch_bytes: usize,
     /// Ticks to wait for a snapshot transfer before trying again.
     pub snapshot_timeout_ticks: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { election_ticks: (10, 20), heartbeat_ticks: 2, max_batch: 512, snapshot_timeout_ticks: 600 }
+        Config {
+            election_ticks: (10, 20),
+            heartbeat_ticks: 2,
+            max_batch: 512,
+            max_batch_bytes: 16 * 1024 * 1024,
+            snapshot_timeout_ticks: 600,
+        }
     }
 }
 
@@ -140,6 +148,8 @@ struct Progress {
     snapshot_sent: Option<u32>,
     /// Answered since the leader last checked for a quorum.
     active: bool,
+    /// The commit index in the last `Append` sent.
+    commit_sent: u64,
 }
 
 /// A small deterministic generator for election timeouts.
@@ -247,6 +257,11 @@ impl Raft {
     pub fn snapshot_position(&self) -> (u64, u64) {
         (self.snapshot_index, self.snapshot_term)
     }
+    /// The log entries after the snapshot.
+    pub fn entries(&self) -> &[LogEntry] {
+        &self.entries
+    }
+
     /// (peer, matched index) as the leader knows them.
     pub fn matched(&self) -> Vec<(NodeId, u64)> {
         self.progress.iter().map(|(p, pr)| (p.clone(), pr.matched)).collect()
@@ -418,8 +433,19 @@ impl Raft {
         let next = progress.next;
         let prev_index = next - 1;
         let prev_term = self.term_at(prev_index).expect("prev is at or after the snapshot");
-        let entries = self.entries_from(next, self.config.max_batch);
-        let message = Message::Append { term, prev_index, prev_term, entries, commit: self.commit };
+        let mut entries = self.entries_from(next, self.config.max_batch);
+        let mut bytes = 0;
+        let fits = entries
+            .iter()
+            .position(|e| {
+                bytes += e.command.len();
+                bytes > self.config.max_batch_bytes
+            })
+            .unwrap_or(entries.len());
+        entries.truncate(fits.max(1));
+        let commit = self.commit;
+        self.progress.get_mut(peer).expect("leader tracks every peer").commit_sent = commit;
+        let message = Message::Append { term, prev_index, prev_term, entries, commit };
         self.send(peer, message);
     }
 
@@ -434,6 +460,13 @@ impl Raft {
         // Only entries of the current term are committed by counting (§5.4.2).
         if candidate > self.commit && self.term_at(candidate) == Some(self.term) {
             self.commit = candidate;
+            // Tell idle followers now rather than at the next heartbeat, so
+            // they apply (and answer their clients) sooner.
+            for peer in self.peers.clone() {
+                if !self.progress[&peer].in_flight {
+                    self.send_append(&peer);
+                }
+            }
         }
     }
 
@@ -558,7 +591,8 @@ impl Raft {
                     progress.matched = progress.matched.max(matched);
                     progress.next = progress.matched + 1;
                     self.advance_commit();
-                    if self.progress[from].next <= self.last_index() {
+                    let p = &self.progress[from];
+                    if !p.in_flight && (p.next <= self.last_index() || p.commit_sent < self.commit) {
                         self.send_append(from);
                     }
                 } else {
@@ -746,7 +780,13 @@ mod tests {
     impl Sim {
         fn new(n: usize, seed: u64, loss: u64) -> Sim {
             let names: Vec<NodeId> = (0..n).map(|i| format!("n{i}")).collect();
-            let config = Config { election_ticks: (10, 20), heartbeat_ticks: 2, max_batch: 7, snapshot_timeout_ticks: 30 };
+            let config = Config {
+                election_ticks: (10, 20),
+                heartbeat_ticks: 2,
+                max_batch: 7,
+                max_batch_bytes: 40,
+                snapshot_timeout_ticks: 30,
+            };
             let mut sim = Sim {
                 rand: Rand(seed),
                 names: names.clone(),

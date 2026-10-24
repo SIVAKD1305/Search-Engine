@@ -102,6 +102,27 @@ built dictionary, or leave Japanese out with
 `cargo build --release -p server --no-default-features --features chinese`;
 without a dictionary each character is a word.
 
+## Cluster with automatic failover
+
+Three (or five) nodes agree on every write with Raft. Writes can go to any
+node (followers forward them to the leader) and are answered once a
+majority has them on disk; every node serves searches. If the leader
+fails, the others elect a new one in about a second and carry on; a node
+that comes back catches up on its own.
+
+```bash
+cargo build --release -p server
+export SEARCH_ADMIN_KEY=my-admin SEARCH_SEARCH_KEY=my-search
+M=a=http://127.0.0.1:7001,b=http://127.0.0.1:7002,c=http://127.0.0.1:7003
+./target/release/server --port 7001 --data-dir data-a --cluster $M --node-id a &
+./target/release/server --port 7002 --data-dir data-b --cluster $M --node-id b &
+./target/release/server --port 7003 --data-dir data-c --cluster $M --node-id c &
+curl -H 'X-Algolia-API-Key: my-admin' http://127.0.0.1:7001/1/cluster/status
+```
+
+All nodes share the admin key. With three nodes, one can be down; with
+five, two.
+
 ## Read replicas
 
 Start more servers that copy everything from a primary and serve searches:

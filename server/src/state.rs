@@ -8,15 +8,16 @@
 //! index (`install_index`).
 
 use crate::ApiError;
-use crate::keys::{KeyStore, RateLimiter};
+use crate::keys::{ApiKey, KeyStore, RateLimiter};
 use crate::storage::{self, Entry, IndexStore, Logged, SnapshotData, StorageError};
 use axum::http::StatusCode;
 use engine::index::{Index, Settings};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
@@ -78,12 +79,58 @@ impl IndexEntry {
 }
 
 /// A requested change, before it is resolved against the stored records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Op {
     Put(String, Map<String, Value>),
     Partial { id: String, changes: Map<String, Value>, create: bool },
     Delete(String),
     Clear,
     Settings(Settings),
+    /// Settings to change, merged into the settings current when applied
+    /// (so concurrent changes of different settings are all kept). The
+    /// result must have been checked to be valid.
+    MergeSettings(Map<String, Value>),
+}
+
+/// The settings `current` would become with `changes`.
+pub fn merge_settings(current: &Settings, changes: &Map<String, Value>) -> Result<Settings, String> {
+    let mut merged = serde_json::to_value(current).expect("settings serialize");
+    for (k, v) in changes {
+        merged[k] = v.clone();
+    }
+    serde_json::from_value(merged).map_err(|e| format!("invalid settings: {e}"))
+}
+
+/// A change agreed on by a cluster (see `cluster`). Every node applies the
+/// same commands in the same order, resolving partial updates as it
+/// applies them, so every node computes the same records, sequence numbers
+/// and epochs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum Command {
+    Write { index: String, create: bool, ops: Vec<Op> },
+    DeleteIndex { index: String },
+    PutKey { key: ApiKey },
+    DeleteKey { value: String },
+}
+
+/// The epoch of an index a cluster created at log entry `log_index`: the
+/// same on every node, different for every re-creation.
+fn cluster_epoch(log_index: u64) -> u64 {
+    // splitmix64
+    let mut z = log_index.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (z ^ (z >> 31)) | 1
+}
+
+/// The header of an exported state (`AppState::export_state`).
+#[derive(Serialize, Deserialize)]
+struct ExportHeader {
+    keys: Vec<ApiKey>,
+    /// Name and byte length of each index's snapshot, in order.
+    indexes: Vec<(String, usize)>,
 }
 
 /// Turns operations into log entries. Partial updates become full records,
@@ -91,6 +138,7 @@ pub enum Op {
 fn resolve(index: &Index, ops: Vec<Op>) -> Vec<Entry> {
     let mut pending: HashMap<String, Option<Map<String, Value>>> = HashMap::new();
     let mut cleared = false;
+    let mut settings_now: Option<Settings> = None;
     let mut entries = Vec::with_capacity(ops.len());
     for op in ops {
         match op {
@@ -124,7 +172,17 @@ fn resolve(index: &Index, ops: Vec<Op>) -> Vec<Entry> {
                 cleared = true;
                 entries.push(Entry::Clear);
             }
-            Op::Settings(settings) => entries.push(Entry::Settings { settings }),
+            Op::Settings(settings) => {
+                settings_now = Some(settings.clone());
+                entries.push(Entry::Settings { settings });
+            }
+            Op::MergeSettings(changes) => {
+                let current = settings_now.as_ref().unwrap_or_else(|| index.settings());
+                if let Ok(settings) = merge_settings(current, &changes) {
+                    settings_now = Some(settings.clone());
+                    entries.push(Entry::Settings { settings });
+                }
+            }
         }
     }
     entries
@@ -180,6 +238,10 @@ pub struct AppState {
     pub(crate) limiter: RateLimiter,
     /// Take the client address from `X-Forwarded-For` (behind a proxy).
     pub(crate) trust_proxy: bool,
+    /// Set when this server is a node of a Raft cluster.
+    pub cluster: OnceLock<Arc<crate::cluster::Cluster>>,
+    /// Random per process, so objectIDs made on different nodes differ.
+    object_salt: u32,
     next_task: AtomicU64,
     next_object: AtomicU64,
     /// Counts every change on any index; replicas wait for it to move.
@@ -203,6 +265,8 @@ impl AppState {
             keys: KeyStore::in_memory(),
             limiter: RateLimiter::default(),
             trust_proxy: false,
+            cluster: OnceLock::new(),
+            object_salt: rand::random(),
             next_task: AtomicU64::new(1),
             next_object: AtomicU64::new(1),
             changes: watch::channel(0).0,
@@ -398,6 +462,11 @@ impl AppState {
 
     /// Commits the operations of several requests, in order, as one write.
     fn commit_batch(&self, entry: &SharedIndex, ops: Vec<Op>) -> Result<(), ApiError> {
+        self.write_ops(entry, ops).map_err(ApiError::storage)
+    }
+
+    /// Resolves `ops` and writes them as the index's next changes.
+    fn write_ops(&self, entry: &IndexEntry, ops: Vec<Op>) -> Result<(), StorageError> {
         let mut log = entry.log.lock().unwrap();
         // One resolution for the whole batch, so a request sees the changes
         // of the requests queued before it.
@@ -405,7 +474,87 @@ impl AppState {
         let first = log.seq + 1;
         let logged: Vec<Logged> =
             entries.into_iter().enumerate().map(|(i, entry)| Logged { seq: first + i as u64, entry }).collect();
-        self.write(entry, &mut log, logged).map_err(ApiError::storage)
+        self.write(entry, &mut log, logged)
+    }
+
+    /// Applies a command a cluster agreed on, from log entry `log_index`.
+    /// Commands that no longer make sense (a write to an index deleted in
+    /// the meantime) do nothing, the same way on every node.
+    pub fn apply_command(&self, command: Command, log_index: u64) -> Result<(), StorageError> {
+        match command {
+            Command::Write { index, create, ops } => {
+                let existing = self.indexes.read().unwrap().get(&index).cloned();
+                let entry = match existing {
+                    Some(entry) => entry,
+                    None if create && crate::validate_index_name(&index).is_ok() => {
+                        let entry = IndexEntry::new(Index::new(Settings::default()), None, 0, cluster_epoch(log_index), Vec::new());
+                        self.indexes.write().unwrap().insert(index, entry.clone());
+                        entry
+                    }
+                    None => return Ok(()),
+                };
+                self.write_ops(&entry, ops)?;
+                self.changed();
+            }
+            Command::DeleteIndex { index } => {
+                self.remove_index(&index)?;
+            }
+            Command::PutKey { key } => {
+                self.keys.put(key)?;
+                self.changed();
+            }
+            Command::DeleteKey { value } => {
+                self.keys.remove(&value)?;
+                self.changed();
+            }
+        }
+        Ok(())
+    }
+
+    /// Every index (with its position) and every key, for a cluster
+    /// snapshot: a JSON header line, then each index's snapshot.
+    pub fn export_state(&self) -> Vec<u8> {
+        let mut parts = Vec::new();
+        let mut indexes = Vec::new();
+        for (name, entry) in self.indexes() {
+            let log = entry.log.lock().unwrap();
+            let index = entry.index.read().unwrap();
+            let mut bytes = Vec::new();
+            storage::write_snapshot_to(&mut bytes, &index, log.seq, log.epoch).expect("writing to memory");
+            indexes.push((name, bytes.len()));
+            parts.push(bytes);
+        }
+        let header = ExportHeader { keys: self.keys.list(), indexes };
+        let mut out = serde_json::to_vec(&header).expect("serializable");
+        out.push(b'\n');
+        for part in parts {
+            out.extend_from_slice(&part);
+        }
+        out
+    }
+
+    /// Replaces every index and key with an exported state.
+    pub fn import_state(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        let corrupt = |m: String| StorageError::Corrupt(format!("cluster snapshot: {m}"));
+        let newline = bytes.iter().position(|&b| b == b'\n').ok_or_else(|| corrupt("no header".into()))?;
+        let header: ExportHeader = serde_json::from_slice(&bytes[..newline]).map_err(|e| corrupt(e.to_string()))?;
+        let mut offset = newline + 1;
+        let mut names = Vec::new();
+        for (name, len) in header.indexes {
+            let part = bytes.get(offset..offset + len).ok_or_else(|| corrupt(format!("{name} is cut short")))?;
+            offset += len;
+            let data = storage::read_snapshot_from(part, Path::new(&name))?;
+            self.install_index(&name, data)?;
+            names.push(name);
+        }
+        for name in self.index_names() {
+            if !names.contains(&name) {
+                self.remove_index(&name)?;
+            }
+        }
+        self.keys.replace_all(header.keys)?;
+        self.changed();
+        Ok(())
     }
 
     /// Applies numbered changes from the primary. Changes already applied
@@ -513,7 +662,7 @@ impl AppState {
     pub fn new_object_id(&self) -> String {
         let n = self.next_object.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        format!("{nanos:x}{n:x}")
+        format!("{nanos:x}{:08x}{n:x}", self.object_salt)
     }
 }
 
