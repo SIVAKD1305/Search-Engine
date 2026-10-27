@@ -123,6 +123,44 @@ curl -H 'X-Algolia-API-Key: my-admin' http://127.0.0.1:7001/1/cluster/status
 All nodes share the admin key. With three nodes, one can be down; with
 five, two.
 
+### Adding and removing nodes while it runs
+
+The member list only starts a cluster. After that the membership lives in
+the cluster's own log, and changes with two requests to any node (admin
+key). To add a node, start it with `--join` (its own `--node-id` and
+`--data-dir`, no member list); it waits, knowing nothing, until the cluster
+adds it:
+
+```bash
+./target/release/server --port 7004 --data-dir data-d --node-id d --join &
+
+curl -X POST http://127.0.0.1:7002/1/cluster/members -H 'X-Algolia-API-Key: my-admin' \
+  -d '{"id": "d", "url": "http://127.0.0.1:7004"}'      # returns once d is a voter
+
+curl http://127.0.0.1:7001/1/cluster/members -H 'X-Algolia-API-Key: my-admin'
+
+curl -X DELETE http://127.0.0.1:7001/1/cluster/members/a -H 'X-Algolia-API-Key: my-admin'
+```
+
+The new node first joins as a **learner**: it receives the log (or the
+leader's snapshot and index images) but does not vote, so a node that is
+still catching up, or that never starts, cannot hold the cluster back. Once
+it is within a hundred entries of the end of the log, it becomes a voter and
+the request returns. If it never catches up (it is not running, or the URL
+is wrong), the request answers `504` after ten minutes and leaves it as a
+learner; start it and repeat the request to finish, or remove it.
+
+To **replace a dead node**, add the new one first and then remove the dead
+one; both need a majority of the current voters to be alive. Voters change
+one at a time, so a cluster can grow and shrink again without stopping, and a leader can remove itself (the others elect a new
+one). Restarting a node later needs no changes: it reads the membership it
+saved, and ignores the member list if it is given one.
+
+A removed node is told that it was removed and stops taking part, but it
+goes on serving searches from the data it had: stop its process. If
+a majority of the voters is lost for good, the cluster cannot change its
+membership (that also takes a majority).
+
 ## Read replicas
 
 Start more servers that copy everything from a primary and serve searches:

@@ -120,6 +120,32 @@ far behind; saving both takes 1.5-4.6 s on a writer thread, while writes go
 on. The first version serialized records and images on the applier,
 which made the pause longer (up to 1.4 s) before the copy was moved off it.
 
+### Adding nodes to a running cluster (11d)
+
+Measured on a MacBook Air (8 GB RAM, 4 cores), real server processes, the
+100k-record catalog loaded through a 3-node cluster (11 s on this machine).
+Everything runs on one laptop, so these are lower bounds for what separate
+machines would give, and the disk is slower than the cloud container's:
+macOS syncs with `F_FULLFSYNC`, so writes ran at about 525/s with 16 writers
+(3,800/s on Linux).
+
+| A node is added when... | Request returns | Serving all records |
+|---|---|---|
+| the log still holds all writes (102 entries of 1,000 records) | 0.35 s | 6.5 s (it indexes 100k records) |
+| 5,000 more writes were made | 1.15 s | 6.2 s |
+| the cluster has snapshotted (entry 10,003) | 0.86 s | 1.15 s (image loaded in 235 ms) |
+
+The request returns when the newcomer has acknowledged the log and is a
+voter; it then applies what it received, which is the rest of the time in
+the first two rows. After `kill -9` of the leader, a new one was elected in
+0.72 s and a write through another node reached the replacement node added
+afterwards.
+
+One number to ignore: the snapshot copy paused writes for 4.3-4.6 s (150 ms
+on the cloud machine). This laptop was swapping (871,695 swap-outs) with six
+servers of 100k records each on it; steady writes without a snapshot had a
+maximum of 66 ms.
+
 ## Geo search (item 8)
 
 The 100k catalog with a `_geoloc` for every record, around 50 random

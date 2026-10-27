@@ -13,17 +13,21 @@
 //!
 //! Every change is fsynced before Raft's messages go out, as Raft requires.
 
-use crate::raft::{HardState, LogEntry};
+use crate::raft::{HardState, LogEntry, Membership};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotHeader {
     pub last_index: u64,
     pub last_term: u64,
+    /// The cluster membership as of `last_index` (absent in snapshots made
+    /// before membership could change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Membership>,
     pub crc: u32,
     pub length: u64,
 }
@@ -137,7 +141,7 @@ impl RaftStore {
             }
         }
         // Entries the snapshot holds may remain after a crash during compaction.
-        let first_needed = snapshot.map_or(1, |s| s.last_index + 1);
+        let first_needed = snapshot.as_ref().map_or(1, |s| s.last_index + 1);
         if entries.iter().any(|e| e.index < first_needed) || entries.windows(2).any(|w| w[1].index != w[0].index + 1) {
             let keep: Vec<LogEntry> = entries.into_iter().filter(|e| e.index >= first_needed).collect();
             if keep.windows(2).any(|w| w[1].index != w[0].index + 1) || keep.first().is_some_and(|e| e.index != first_needed) {
@@ -257,9 +261,20 @@ impl RaftStore {
 
     /// Writes a snapshot file at `path` (via a temporary file), returning
     /// its header.
-    pub fn write_snapshot(path: &Path, last_index: u64, last_term: u64, state: &[u8]) -> io::Result<SnapshotHeader> {
-        let header =
-            SnapshotHeader { last_index, last_term, crc: crc32fast::hash(state), length: state.len() as u64 };
+    pub fn write_snapshot(
+        path: &Path,
+        last_index: u64,
+        last_term: u64,
+        members: &Membership,
+        state: &[u8],
+    ) -> io::Result<SnapshotHeader> {
+        let header = SnapshotHeader {
+            last_index,
+            last_term,
+            members: Some(members.clone()),
+            crc: crc32fast::hash(state),
+            length: state.len() as u64,
+        };
         let mut bytes = serde_json::to_vec(&header)?;
         bytes.push(b'\n');
         bytes.extend_from_slice(state);
@@ -269,9 +284,20 @@ impl RaftStore {
 
     /// Writes a snapshot file next to `path` under a temporary name, synced,
     /// for `install` to rename into place.
-    pub fn prepare_snapshot(path: &Path, last_index: u64, last_term: u64, state: &[u8]) -> io::Result<PathBuf> {
-        let header =
-            SnapshotHeader { last_index, last_term, crc: crc32fast::hash(state), length: state.len() as u64 };
+    pub fn prepare_snapshot(
+        path: &Path,
+        last_index: u64,
+        last_term: u64,
+        members: &Membership,
+        state: &[u8],
+    ) -> io::Result<PathBuf> {
+        let header = SnapshotHeader {
+            last_index,
+            last_term,
+            members: Some(members.clone()),
+            crc: crc32fast::hash(state),
+            length: state.len() as u64,
+        };
         let mut name = path.as_os_str().to_owned();
         name.push(format!(".tmp-{:016x}", rand::random::<u64>()));
         let tmp = PathBuf::from(name);
@@ -318,7 +344,7 @@ mod tests {
     use super::*;
 
     fn entry(index: u64, term: u64) -> LogEntry {
-        LogEntry { index, term, command: format!("c{index}") }
+        LogEntry { index, term, command: format!("c{index}"), members: None }
     }
 
     #[test]
@@ -337,7 +363,7 @@ mod tests {
         assert_eq!(loaded.entries, [entry(1, 1), entry(2, 1), entry(3, 3), entry(4, 3)]);
         // Compaction: a snapshot at 2, then the log rewritten.
         let path = loaded.store.snapshot_path();
-        RaftStore::write_snapshot(&path, 2, 1, b"state").unwrap();
+        RaftStore::write_snapshot(&path, 2, 1, &Membership::default(), b"state").unwrap();
         loaded.store.rewrite(&[entry(3, 3), entry(4, 3)]).unwrap();
         loaded.store.write_log(5, &[entry(5, 3)]).unwrap();
         drop(loaded);
@@ -377,17 +403,37 @@ mod tests {
         let mut loaded = RaftStore::open(dir.path()).unwrap();
         loaded.store.write_log(1, &[entry(1, 1), entry(2, 1), entry(3, 1)]).unwrap();
         // A crash after the snapshot was written but before the log rewrite.
-        RaftStore::write_snapshot(&loaded.store.snapshot_path(), 2, 1, b"s").unwrap();
+        RaftStore::write_snapshot(&loaded.store.snapshot_path(), 2, 1, &Membership::default(), b"s").unwrap();
         drop(loaded);
         let loaded = RaftStore::open(dir.path()).unwrap();
         assert_eq!(loaded.entries, [entry(3, 1)]);
     }
 
     #[test]
+    fn membership_changes_survive_in_the_log_and_the_snapshot_header() {
+        use crate::raft::Member;
+        let member = |id: &str| Member { id: id.into(), url: format!("http://{id}") };
+        let members = Membership { voters: vec![member("a"), member("b")], learners: vec![member("c")] };
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = RaftStore::open(dir.path()).unwrap();
+        let change = LogEntry { index: 2, term: 1, command: String::new(), members: Some(members.clone()) };
+        loaded.store.write_log(1, &[entry(1, 1), change.clone()]).unwrap();
+        let path = loaded.store.snapshot_path();
+        RaftStore::write_snapshot(&path, 1, 1, &members, b"s").unwrap();
+        drop(loaded);
+        let loaded = RaftStore::open(dir.path()).unwrap();
+        assert_eq!(loaded.entries, [change]);
+        assert_eq!(loaded.snapshot.unwrap().members, Some(members));
+        // A header from before membership changes has none.
+        fs::write(&path, "{\"lastIndex\":1,\"lastTerm\":1,\"crc\":0,\"length\":0}\n").unwrap();
+        assert_eq!(RaftStore::read_snapshot(&path).unwrap().0.members, None);
+    }
+
+    #[test]
     fn leftovers_of_a_crash_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snapshot");
-        let prepared = RaftStore::prepare_snapshot(&path, 3, 1, b"s").unwrap();
+        let prepared = RaftStore::prepare_snapshot(&path, 3, 1, &Membership::default(), b"s").unwrap();
         fs::write(dir.path().join("snapshot.incoming-12"), b"x").unwrap();
         fs::write(dir.path().join("snapshot.incoming-12.image"), b"x").unwrap();
         RaftStore::open(dir.path()).unwrap();
@@ -402,7 +448,7 @@ mod tests {
     fn damaged_snapshots_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snapshot");
-        RaftStore::write_snapshot(&path, 7, 2, b"some state").unwrap();
+        RaftStore::write_snapshot(&path, 7, 2, &Membership::default(), b"some state").unwrap();
         let mut bytes = fs::read(&path).unwrap();
         assert!(RaftStore::parse_snapshot(&bytes).is_ok());
         let last = bytes.len() - 1;

@@ -3,7 +3,7 @@
 An Algolia-style search engine written from scratch in Rust: engine library,
 HTTP server with Algolia's REST API, read replicas, and a Raft cluster with
 automatic failover. Built step by step; `ROADMAP.md` lists what is done
-(steps 1-11c) and the known gaps, `docs/benchmarks.md` every measurement.
+(steps 1-11d) and the known gaps, `docs/benchmarks.md` every measurement.
 
 ## Layout
 
@@ -32,8 +32,13 @@ automatic failover. Built step by step; `ROADMAP.md` lists what is done
   the first build. Without network access, build with
   `--no-default-features --features chinese` (server) or set
   `LINDERA_BUILD_DICTIONARY_CACHE_DIR` to a prebuilt dictionary.
-- Raft safety tests run 40 random seeds by default; `RAFT_SEEDS=2000` for a
-  longer run after changing `raft.rs`.
+- Raft safety tests (`safety_holds_under_random_faults`, and
+  `safety_holds_while_the_membership_changes`) run 40 random seeds by
+  default; `RAFT_SEEDS=2000` for a longer run after changing `raft.rs`. They
+  cannot detect a missing "committed an entry of this term" guard before
+  membership changes; `a_new_leader_waits_for_an_entry_of_its_own_term` does.
+- On macOS file syncs are `F_FULLFSYNC`, so writes are several times slower
+  than on Linux; sed needs `-i ''`.
 - Measure before and after performance changes (`bench_queries`,
   `loadtest`) and record results in `docs/benchmarks.md`; keep
   `ROADMAP.md` up to date when a step is done.
@@ -42,7 +47,7 @@ automatic failover. Built step by step; `ROADMAP.md` lists what is done
 
 ## Next candidates
 
-From ROADMAP.md: adding and removing cluster nodes while running (Raft
-membership changes), a load test across separate machines, approximate
-facet counts on very large results, memory-mapped images for near-instant
-startup at 1M records.
+From ROADMAP.md: a load test across separate machines, approximate facet
+counts on very large results, memory-mapped images for near-instant startup
+at 1M records, reporting a learner's applied position so it is promoted only
+once it serves complete results, leadership transfer.

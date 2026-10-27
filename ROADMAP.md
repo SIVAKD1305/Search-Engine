@@ -105,6 +105,21 @@
     writer thread. 117k records: restart 13-17 s -> 0.6 s, a follower
     31,000 entries behind caught up in 4 s, writes wait 150 ms per snapshot
     instead of 0.4-1.4 s.
+11d. ✅ Adding and removing cluster nodes while it runs: `--join` starts a
+    node that waits to be added; `POST /1/cluster/members` adds it as a
+    non-voting learner, waits until it has caught up, then makes it a voter;
+    `DELETE /1/cluster/members/{id}` removes a voter or learner. Voters change
+    one at a time (Raft thesis §4.1), the membership takes effect when it is
+    in a node's log, snapshots carry it, and a removed node is told. Found
+    by the fault simulation, which now also adds, promotes and removes nodes
+    at random (3,000 runs): a leader removing itself could panic while
+    committing its own removal; a stale follower that never campaigns
+    refused votes forever because its election timer looked like leader
+    contact; and a node whose own removal was in its log, uncommitted, but
+    that held the longest log, left the voter it was leaving unable to win.
+    Real processes on a laptop (100k records): a node added in 0.35 s and
+    serving everything after 6.5 s by replaying the log, or 1.15 s from a
+    snapshot's index image; failover 0.7 s.
 
 ## Next
 
@@ -128,8 +143,17 @@
   up to 10 s, so catch-up after an outage can take that long; replicas use the
   primary's admin key (a dedicated replication key would be safer);
   replication traffic is plain HTTP unless the primary URL is https.
-- Cluster gaps: membership is fixed at startup (no adding or removing
-  nodes while running); a snapshot copies the whole state in memory (writes
+- Cluster membership gaps: a new node becomes a voter once it has
+  acknowledged the log, not once it has applied it (indexing 100k records
+  takes about 6 s more, during which its searches are incomplete; its applied
+  position is not reported to the leader); a removed node goes on serving
+  its old data until its process is stopped, and is not told if the leader
+  fails right after removing it; there is no way to change the membership
+  after losing a majority for good (that needs a forced, unsafe recovery);
+  one operator at a time: a second change waits for the first; a leader
+  hands over only by being removed and elected around, there is no
+  leadership transfer.
+- Cluster gaps: a snapshot copies the whole state in memory (writes
   wait about 150 ms at 117k records, every 10,000 entries, and memory
   briefly doubles); snapshots are sent and received whole in memory, image
   included (230 MB at 117k records); searches read the local copy, so they can lag

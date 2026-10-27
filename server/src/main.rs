@@ -3,7 +3,7 @@
 //! Usage: server [--host 127.0.0.1] [--port 8080] [--data-dir DIR | --in-memory]
 //!               [--load NAME=records.jsonl[,settings.json]]...
 //!               [--replica-of PRIMARY_URL] [--trust-proxy]
-//!               [--cluster ID=URL,ID=URL,... --node-id ID]
+//!               [--cluster ID=URL,ID=URL,... --node-id ID | --join --node-id ID]
 //!        server secured-key PARENT_KEY 'filters=...&validUntil=...'
 //!
 //! Data is kept in DIR (default `./search-data`) and reloaded at startup.
@@ -23,7 +23,12 @@
 //! leader fails. Each node is started with the same member list, its own
 //! `--node-id` and its own `--data-dir` (the Raft log and snapshots go in
 //! `DIR/raft`); all share SEARCH_ADMIN_KEY. `--load` submits the records
-//! through the cluster once it has a leader.
+//! through the cluster once it has a leader. The member list only starts a
+//! new cluster: after that the membership lives in the Raft log and
+//! snapshots, and changes with `POST /1/cluster/members` and
+//! `DELETE /1/cluster/members/ID`. To add a node, start it with `--join`
+//! (and its `--node-id` and `--data-dir`, no member list): it waits until
+//! the cluster adds it, then receives all data from the leader.
 //!
 //! `--trust-proxy` takes client addresses (for rate limits and
 //! `restrictSources`) from `X-Forwarded-For`; use it only behind a proxy
@@ -82,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trust_proxy = false;
     let mut cluster: Option<String> = None;
     let mut node_id: Option<String> = None;
+    let mut join = false;
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("secured-key") {
         let (Some(parent), Some(params)) = (args.nth(1), args.next()) else {
@@ -101,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--trust-proxy" => trust_proxy = true,
             "--cluster" => cluster = Some(args.next().ok_or("--cluster needs ID=URL,ID=URL,...")?),
             "--node-id" => node_id = Some(args.next().ok_or("--node-id needs a value")?),
+            "--join" => join = true,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -117,9 +124,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("search key: {search_key}  (set SEARCH_SEARCH_KEY to keep it)");
     }
 
-    if let Some(spec) = &cluster {
-        let members = ClusterConfig::parse_members(spec)?;
-        let id = node_id.ok_or("--cluster needs --node-id")?;
+    if join && cluster.is_some() {
+        return Err("--join waits to be added to a running cluster; --cluster starts a new one".into());
+    }
+    if cluster.is_some() || join {
+        let members = match &cluster {
+            Some(spec) => ClusterConfig::parse_members(spec)?,
+            None => Vec::new(),
+        };
+        let id = node_id.ok_or("a cluster node needs --node-id")?;
         let dir = data_dir.ok_or("a cluster node needs a --data-dir")?.join("raft");
         if replica_of.is_some() {
             return Err("--cluster and --replica-of cannot be combined".into());
@@ -129,9 +142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = ClusterConfig::new(id.clone(), members, dir, admin_key);
         let node = Cluster::start(state.clone(), config)?;
         println!(
-            "cluster node {id}: {} index(es) loaded in {:.0} ms",
+            "cluster node {id}: {} index(es) loaded in {:.0} ms{}",
             state.index_names().len(),
-            start.elapsed().as_secs_f64() * 1000.0
+            start.elapsed().as_secs_f64() * 1000.0,
+            if join && node.status().members.voters.is_empty() { "; waiting to be added to a cluster" } else { "" }
         );
         let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
         println!("listening on http://{}", listener.local_addr()?);
